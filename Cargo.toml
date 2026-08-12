@@ -1,0 +1,57 @@
+[workspace]
+members = ["crates/*"]
+# Resolver v3 is MSRV-aware: it will not select a dependency version requiring
+# a newer rustc than `workspace.package.rust-version`. Without it, a
+# `cargo update` silently pulls crates the declared toolchain cannot build —
+# the AWS SDK crates did exactly that in the dyaka workspace this code was
+# extracted from.
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The real floor, inherited from dyaka, and it is not arbitrary:
+#   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
+#     before 1.94;
+#   * the AWS SDK crates declare 1.94.1.
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/libid-org/libid-rs"
+
+[workspace.dependencies]
+# Intra-workspace crates. Path + version so the publishable subset can be
+# released to crates.io while local builds resolve in-tree.
+libid-crypto = { path = "crates/libid-crypto", version = "0.1.0" }
+libid-signer = { path = "crates/libid-signer", version = "0.1.0" }
+libid-transcript = { path = "crates/libid-transcript", version = "0.1.0" }
+libid-attestations = { path = "crates/libid-attestations", version = "0.1.0" }
+
+alloy = { version = "1", default-features = false }
+alloy-primitives = { version = "1", features = ["serde"] }
+alloy-sol-types = "1"
+# KMS-backed signing. alloy's `signer-aws` feature re-exports
+# `alloy::signers::aws::AwsSigner`, but constructing one needs an
+# `aws_sdk_kms::Client`, so the SDK is a direct dependency too. Both are
+# pinned to the 1.x line so cargo unifies them with whatever alloy resolves.
+aws-config = "1"
+aws-sdk-kms = "1"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["full"] }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# Upstream TLSNotary, same pin as dyaka. A GIT dependency: any crate that
+# names it in its manifest cannot be published to crates.io (see
+# crates/libid-tlsn/Cargo.toml).
+tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "040c6881f3ec65ea042de134a0586b23cf382443" }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+# TS bindings codegen — opt-in via the `ts` feature of libid-transcript.
+ts-rs = { version = "10", features = ["serde-compat"] }
+webpki-root-certs = "1.0"

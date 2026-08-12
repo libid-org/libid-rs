@@ -1,0 +1,17 @@
+[package]
+name = "libid-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Contract-agnostic crypto primitives for the libID stack: keccak256, EIP-191 sign/recover, sorted-pair keccak Merkle trees (OpenZeppelin-compatible), and Ethereum address helpers."
+keywords = ["ethereum", "keccak", "merkle", "eip-191", "secp256k1"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+hex.workspace = true
+k256.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tiny-keccak.workspace = true

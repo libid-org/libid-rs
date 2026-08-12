@@ -1,0 +1,26 @@
+[package]
+name = "libid-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One signing abstraction for local hex keys and AWS KMS keys: EIP-191 claim signing, tlsn-style prehash signing, alloy transaction wallets, and shape-classified key-spec parsing."
+keywords = ["ethereum", "signer", "kms", "alloy", "eip-191"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+alloy = { workspace = true, features = [
+    "network",
+    "signers",
+    "signer-local",
+    "signer-aws",
+] }
+aws-config.workspace = true
+aws-sdk-kms.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+libid-crypto.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

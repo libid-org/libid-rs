@@ -1,0 +1,18 @@
+[package]
+name = "libid-attestations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Contract-ABI-shaped digest builders for the libID verifiers: notary, backend, token/me attestation and JWKS-rotation digests, byte-pinned against the Solidity implementations."
+keywords = ["ethereum", "attestation", "digest", "abi", "notary"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+libid-crypto.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
