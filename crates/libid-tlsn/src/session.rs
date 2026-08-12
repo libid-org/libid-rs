@@ -48,9 +48,15 @@ use tlsn::{
     },
     Session,
 };
-use tokio::io::{
-    AsyncRead,
-    AsyncWrite,
+use tokio::{
+    io::{
+        AsyncRead,
+        AsyncWrite,
+    },
+    task::{
+        JoinError,
+        JoinHandle,
+    },
 };
 use tokio_util::compat::{
     Compat,
@@ -81,6 +87,58 @@ pub const MAX_SENT_DATA: usize = 1 << 12;
 /// Maximum bytes the prover may receive in the MPC-TLS session (32 KB). The
 /// verifier rejects sessions configured above this.
 pub const MAX_RECV_DATA: usize = 1 << 15;
+
+/// Owns a spawned task and aborts it on drop unless the handle was taken back
+/// out with [`AbortOnDrop::into_inner`].
+///
+/// Dropping a bare [`JoinHandle`] DETACHES the task rather than cancelling
+/// it, so every `?` early return in the session functions below would leave
+/// the spawned driver running unsupervised — each aborted connection (e.g. a
+/// kubelet `tcpSocket` health probe) then retains the task and its MPC
+/// buffers. With this guard, cancellation is the default on every exit path,
+/// including panics and the caller dropping the session future; the success
+/// path opts out by taking the handle back to join it.
+struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// The wrapped handle, for polling the task without disarming the guard.
+    fn handle_mut(&mut self) -> &mut JoinHandle<T> {
+        self.0.as_mut().expect("handle present until into_inner")
+    }
+
+    /// Disarm the guard and hand the handle back for joining.
+    fn into_inner(mut self) -> JoinHandle<T> {
+        self.0.take().expect("handle present until into_inner")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Error for a session driver that finished while session setup was still in
+/// flight. The driver only completes once the underlying socket is closed or
+/// dead, so a protocol request submitted to it may never resolve — the racy
+/// wedge behind the notary health-probe leak: without this check,
+/// [`verifier`] could pend forever on a connection that closed immediately.
+fn driver_finished_early<T, E: std::fmt::Display>(
+    result: std::result::Result<std::result::Result<T, E>, JoinError>,
+) -> Error {
+    let detail = match result {
+        Ok(Ok(_)) => "driver task finished before the session completed".into(),
+        Ok(Err(e)) => format!("driver task: {e}"),
+        Err(e) => format!("driver task join: {e}"),
+    };
+    Error::MpcTlsFailed { detail }
+}
 
 /// Sub-steps within the MPC-TLS prover phase, reported via callback.
 #[derive(Debug, Clone, Copy)]
@@ -275,11 +333,13 @@ where
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
-    let driver_task = tokio::spawn(driver);
+    // Guarded spawn: every exit path below — each `?`, panics, the caller
+    // dropping this future — aborts the driver instead of detaching it.
+    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
-    info!("Setting up MPC-TLS");
-    let prover =
-        handle
+    let setup = async {
+        info!("Setting up MPC-TLS");
+        let prover = handle
             .new_prover(ProverConfig::builder().build().map_err(|e| {
                 Error::MpcTlsFailed {
                     detail: format!("prover config: {e}"),
@@ -301,224 +361,244 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("commit: {e}"),
             })?;
-    on_progress(ProverStep::MpcSetupComplete);
+        on_progress(ProverStep::MpcSetupComplete);
 
-    info!("Connecting to {} API", api_host);
-    let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
-    let (tls, prover) = prover
-        .connect(
-            TlsClientConfig::builder()
-                .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
-                    Error::MpcTlsFailed {
-                        detail: format!("server name: {e}"),
-                    }
-                })?))
-                .root_store(root_store())
-                .build()
+        info!("Connecting to {} API", api_host);
+        let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
+        let (tls, prover) = prover
+            .connect(
+                TlsClientConfig::builder()
+                    .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
+                        Error::MpcTlsFailed {
+                            detail: format!("server name: {e}"),
+                        }
+                    })?))
+                    .root_store(root_store())
+                    .build()
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("tls client config: {e}"),
+                    })?,
+                tcp.compat(),
+            )
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("connect: {e}"),
+            })?;
+        on_progress(ProverStep::TlsHandshakeComplete);
+
+        let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(tls.compat()))
+                .await
                 .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("tls client config: {e}"),
-                })?,
-            tcp.compat(),
-        )
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("connect: {e}"),
-        })?;
-    on_progress(ProverStep::TlsHandshakeComplete);
+                    detail: format!("http handshake: {e}"),
+                })?;
+        // The HTTP connection task normally finishes with the `Connection: close`
+        // exchange; the guard reaps it if the session bails out first.
+        let _conn_task = AbortOnDrop::new(tokio::spawn(conn));
 
-    let prover_task = tokio::spawn(prover.into_future());
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tls.compat()))
+        let http_request = {
+            let mut builder = hyper::Request::builder()
+                .method(request.method)
+                .uri(request.path)
+                .header("Host", api_host)
+                .header("Connection", "close")
+                .header("Accept", "application/json")
+                .header("User-Agent", request.user_agent);
+            if let Some(token) = request.bearer_token {
+                builder = builder.header("Authorization", format!("Bearer {}", token));
+            }
+            if request.body.is_some() {
+                builder = builder.header("Content-Type", "application/json");
+            }
+            if let Some(post_body) = request.body {
+                builder
+                    .body(http_body_util::Full::new(Bytes::from(
+                        post_body.to_string(),
+                    )))
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("request build: {e}"),
+                    })?
+            } else {
+                builder
+                    .body(http_body_util::Full::new(Bytes::new()))
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("request build: {e}"),
+                    })?
+            }
+        };
+
+        info!("Sending {} {}", request.method, request.path);
+        let response =
+            sender
+                .send_request(http_request)
+                .await
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("send request: {e}"),
+                })?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
             .await
             .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("http handshake: {e}"),
-            })?;
-    tokio::spawn(conn);
+                detail: format!("collect body: {e}"),
+            })?
+            .to_bytes();
+        if status != StatusCode::OK {
+            return Err(Error::MpcTlsFailed {
+                detail: format!(
+                    "API returned {}: {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
+            });
+        }
+        info!("Response: {} bytes", body.len());
+        on_progress(ProverStep::PlatformDataFetched);
 
-    let http_request = {
-        let mut builder = hyper::Request::builder()
-            .method(request.method)
-            .uri(request.path)
-            .header("Host", api_host)
-            .header("Connection", "close")
-            .header("Accept", "application/json")
-            .header("User-Agent", request.user_agent);
-        if let Some(token) = request.bearer_token {
-            builder = builder.header("Authorization", format!("Bearer {}", token));
-        }
-        if request.body.is_some() {
-            builder = builder.header("Content-Type", "application/json");
-        }
-        if let Some(post_body) = request.body {
-            builder
-                .body(http_body_util::Full::new(Bytes::from(
-                    post_body.to_string(),
-                )))
+        let mut prover = prover_task
+            .into_inner()
+            .await
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("prover task join: {e}"),
+            })?
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("prover task: {e}"),
+            })?;
+        let transcript = prover.transcript().clone();
+        let sent = transcript.sent();
+        let recv = transcript.received();
+        let reveal_recv_ranges = compute_reveal_ranges(recv)?;
+
+        // Save the revealed recv segments BEFORE the transcript is moved.
+        // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
+        // saving them here lets the ZK prover verify the full chain.
+        let recv_segments: Vec<Vec<u8>> = reveal_recv_ranges
+            .iter()
+            .map(|r| recv[r.clone()].to_vec())
+            .collect();
+
+        let notary_sent_ranges = find_notary_reveal_ranges(sent);
+
+        let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
+        for range in find_presentation_commit_ranges(sent) {
+            tc_builder
+                .commit_sent(&range)
                 .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("request build: {e}"),
-                })?
-        } else {
-            builder
-                .body(http_body_util::Full::new(Bytes::new()))
+                    detail: format!("commit sent: {e}"),
+                })?;
+        }
+        tc_builder
+            .commit_recv(&(0..recv.len()))
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("commit recv: {e}"),
+            })?;
+        let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
+            detail: format!("transcript commit config: {e}"),
+        })?;
+
+        let mut prove_config = ProveConfig::builder(&transcript);
+        prove_config.server_identity();
+        for range in &notary_sent_ranges {
+            prove_config
+                .reveal_sent(range)
                 .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("request build: {e}"),
-                })?
+                    detail: format!("reveal sent: {e}"),
+                })?;
+        }
+        for range in &reveal_recv_ranges {
+            prove_config
+                .reveal_recv(range)
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("reveal recv: {e}"),
+                })?;
+        }
+        prove_config.transcript_commit(transcript_commit.clone());
+
+        let prover_output: ProverOutput = prover
+            .prove(&prove_config.build().map_err(|e| Error::MpcTlsFailed {
+                detail: format!("prove config: {e}"),
+            })?)
+            .await
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("prove: {e}"),
+            })?;
+        info!("MPC-TLS proof complete");
+        on_progress(ProverStep::MpcProofFinalized);
+
+        let tls_transcript = prover.tls_transcript().clone();
+        let handshake = extract_handshake_data(&tls_transcript)?;
+
+        let mut req_config = RequestConfig::builder();
+        req_config
+            .signature_alg(SignatureAlgId::SECP256K1ETH)
+            .hash_alg(HashAlgId::KECCAK256)
+            .transcript_commit(transcript_commit);
+        let req_config = req_config.build().map_err(|e| Error::MpcTlsFailed {
+            detail: format!("request config: {e}"),
+        })?;
+
+        let certs = tls_transcript
+            .server_cert_chain()
+            .ok_or_else(|| Error::MpcTlsFailed {
+                detail: "server cert chain not available".into(),
+            })?
+            .to_vec();
+        let sig = tls_transcript
+            .server_signature()
+            .ok_or_else(|| Error::MpcTlsFailed {
+                detail: "server signature not available".into(),
+            })?
+            .clone();
+        let binding = tls_transcript.certificate_binding().clone();
+
+        let mut req_builder = Request::builder(&req_config);
+        req_builder
+            .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
+                Error::MpcTlsFailed {
+                    detail: format!("server name: {e}"),
+                }
+            })?))
+            .handshake_data(HandshakeData {
+                certs,
+                sig,
+                binding,
+            })
+            .transcript(transcript)
+            .transcript_commitments(
+                prover_output.transcript_secrets,
+                prover_output.transcript_commitments,
+            );
+        let (att_request, secrets) = req_builder
+            .build(&CryptoProvider::default())
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("attestation request: {e}"),
+            })?;
+        info!("Attestation request built");
+
+        prover.close().await.map_err(|e| Error::MpcTlsFailed {
+            detail: format!("prover close: {e}"),
+        })?;
+        handle.close();
+
+        Ok((body, recv_segments, att_request, secrets, handshake))
+    };
+    tokio::pin!(setup);
+
+    // Race setup against the driver. The driver only finishes early when the
+    // connection to the verifier died under the session — a protocol request
+    // already submitted to it may then never resolve, so fail instead of
+    // pending forever.
+    let (body, recv_segments, att_request, secrets, handshake) = tokio::select! {
+        biased;
+        res = &mut setup => res?,
+        driver_res = driver_task.handle_mut() => {
+            return Err(driver_finished_early(driver_res));
         }
     };
 
-    info!("Sending {} {}", request.method, request.path);
-    let response =
-        sender
-            .send_request(http_request)
-            .await
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("send request: {e}"),
-            })?;
-    let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("collect body: {e}"),
-        })?
-        .to_bytes();
-    if status != StatusCode::OK {
-        return Err(Error::MpcTlsFailed {
-            detail: format!(
-                "API returned {}: {}",
-                status,
-                String::from_utf8_lossy(&body)
-            ),
-        });
-    }
-    info!("Response: {} bytes", body.len());
-    on_progress(ProverStep::PlatformDataFetched);
-
-    let mut prover = prover_task
-        .await
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("prover task join: {e}"),
-        })?
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("prover task: {e}"),
-        })?;
-    let transcript = prover.transcript().clone();
-    let sent = transcript.sent();
-    let recv = transcript.received();
-    let reveal_recv_ranges = compute_reveal_ranges(recv)?;
-
-    // Save the revealed recv segments BEFORE the transcript is moved.
-    // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
-    // saving them here lets the ZK prover verify the full chain.
-    let recv_segments: Vec<Vec<u8>> = reveal_recv_ranges
-        .iter()
-        .map(|r| recv[r.clone()].to_vec())
-        .collect();
-
-    let notary_sent_ranges = find_notary_reveal_ranges(sent);
-
-    let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-    for range in find_presentation_commit_ranges(sent) {
-        tc_builder
-            .commit_sent(&range)
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("commit sent: {e}"),
-            })?;
-    }
-    tc_builder
-        .commit_recv(&(0..recv.len()))
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("commit recv: {e}"),
-        })?;
-    let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
-        detail: format!("transcript commit config: {e}"),
-    })?;
-
-    let mut prove_config = ProveConfig::builder(&transcript);
-    prove_config.server_identity();
-    for range in &notary_sent_ranges {
-        prove_config
-            .reveal_sent(range)
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("reveal sent: {e}"),
-            })?;
-    }
-    for range in &reveal_recv_ranges {
-        prove_config
-            .reveal_recv(range)
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("reveal recv: {e}"),
-            })?;
-    }
-    prove_config.transcript_commit(transcript_commit.clone());
-
-    let prover_output: ProverOutput = prover
-        .prove(&prove_config.build().map_err(|e| Error::MpcTlsFailed {
-            detail: format!("prove config: {e}"),
-        })?)
-        .await
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("prove: {e}"),
-        })?;
-    info!("MPC-TLS proof complete");
-    on_progress(ProverStep::MpcProofFinalized);
-
-    let tls_transcript = prover.tls_transcript().clone();
-    let handshake = extract_handshake_data(&tls_transcript)?;
-
-    let mut req_config = RequestConfig::builder();
-    req_config
-        .signature_alg(SignatureAlgId::SECP256K1ETH)
-        .hash_alg(HashAlgId::KECCAK256)
-        .transcript_commit(transcript_commit);
-    let req_config = req_config.build().map_err(|e| Error::MpcTlsFailed {
-        detail: format!("request config: {e}"),
-    })?;
-
-    let certs = tls_transcript
-        .server_cert_chain()
-        .ok_or_else(|| Error::MpcTlsFailed {
-            detail: "server cert chain not available".into(),
-        })?
-        .to_vec();
-    let sig = tls_transcript
-        .server_signature()
-        .ok_or_else(|| Error::MpcTlsFailed {
-            detail: "server signature not available".into(),
-        })?
-        .clone();
-    let binding = tls_transcript.certificate_binding().clone();
-
-    let mut req_builder = Request::builder(&req_config);
-    req_builder
-        .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
-            Error::MpcTlsFailed {
-                detail: format!("server name: {e}"),
-            }
-        })?))
-        .handshake_data(HandshakeData {
-            certs,
-            sig,
-            binding,
-        })
-        .transcript(transcript)
-        .transcript_commitments(
-            prover_output.transcript_secrets,
-            prover_output.transcript_commitments,
-        );
-    let (att_request, secrets) =
-        req_builder.build(&CryptoProvider::default()).map_err(|e| {
-            Error::MpcTlsFailed {
-                detail: format!("attestation request: {e}"),
-            }
-        })?;
-    info!("Attestation request built");
-
-    prover.close().await.map_err(|e| Error::MpcTlsFailed {
-        detail: format!("prover close: {e}"),
-    })?;
-    handle.close();
     let recovered_compat: Compat<T> = driver_task
+        .into_inner()
         .await
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),
@@ -545,97 +625,123 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
 ) -> Result<VerifierResult<T>> {
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
-    let driver_task = tokio::spawn(driver);
+    // Guarded spawn: every exit path below — each `?`, panics, the caller
+    // dropping this future — aborts the driver instead of detaching it.
+    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
-    let verifier = handle
-        .new_verifier(
-            VerifierConfig::builder()
-                .root_store(root_store())
-                .build()
-                .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("verifier config: {e}"),
-                })?,
-        )
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("new verifier: {e}"),
-        })?
-        .commit()
-        .await
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("verifier commit: {e}"),
-        })?;
+    let setup = async {
+        let verifier = handle
+            .new_verifier(
+                VerifierConfig::builder()
+                    .root_store(root_store())
+                    .build()
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("verifier config: {e}"),
+                    })?,
+            )
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("new verifier: {e}"),
+            })?
+            .commit()
+            .await
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("verifier commit: {e}"),
+            })?;
 
-    let verifier = match verifier {
-        VerifierCommitStart::Mpc(v) => {
-            if v.config().max_sent_data() > MAX_SENT_DATA
-                || v.config().max_recv_data() > MAX_RECV_DATA
-            {
-                v.reject(Some("data limits exceeded")).await.map_err(|e| {
-                    Error::MpcTlsFailed {
-                        detail: format!("reject: {e}"),
-                    }
-                })?;
+        let verifier = match verifier {
+            VerifierCommitStart::Mpc(v) => {
+                if v.config().max_sent_data() > MAX_SENT_DATA
+                    || v.config().max_recv_data() > MAX_RECV_DATA
+                {
+                    v.reject(Some("data limits exceeded")).await.map_err(|e| {
+                        Error::MpcTlsFailed {
+                            detail: format!("reject: {e}"),
+                        }
+                    })?;
+                    return Err(Error::MpcTlsFailed {
+                        detail: "data limits exceeded".into(),
+                    });
+                }
+                v.accept().await.map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("accept: {e}"),
+                })?
+            }
+            _ => {
                 return Err(Error::MpcTlsFailed {
-                    detail: "data limits exceeded".into(),
+                    detail: "expected MPC-TLS protocol".into(),
                 });
             }
-            v.accept().await.map_err(|e| Error::MpcTlsFailed {
-                detail: format!("accept: {e}"),
-            })?
-        }
-        _ => {
+        };
+
+        let verifier = verifier.run().await.map_err(|e| Error::MpcTlsFailed {
+            detail: format!("run: {e}"),
+        })?;
+
+        let tls_transcript = verifier.tls_transcript().clone();
+
+        let verifier = verifier.verify().await.map_err(|e| Error::MpcTlsFailed {
+            detail: format!("verify: {e}"),
+        })?;
+        if !verifier.request().server_identity() {
+            verifier
+                .reject(Some("expecting server identity"))
+                .await
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("reject: {e}"),
+                })?;
             return Err(Error::MpcTlsFailed {
-                detail: "expected MPC-TLS protocol".into(),
+                detail: "no server identity".into(),
             });
+        }
+
+        let (output, verifier) =
+            verifier.accept().await.map_err(|e| Error::MpcTlsFailed {
+                detail: format!("accept verify: {e}"),
+            })?;
+
+        let VerifierOutput {
+            server_name,
+            transcript,
+            transcript_commitments,
+            ..
+        } = output;
+        let server_name = server_name.ok_or_else(|| Error::MpcTlsFailed {
+            detail: "server name not revealed".into(),
+        })?;
+        let transcript = transcript.ok_or_else(|| Error::MpcTlsFailed {
+            detail: "transcript not revealed".into(),
+        })?;
+        let ServerName::Dns(ref name) = server_name;
+        info!("Verified server: {}", name.as_str());
+
+        verifier.close().await.map_err(|e| Error::MpcTlsFailed {
+            detail: format!("verifier close: {e}"),
+        })?;
+        handle.close();
+
+        Ok((
+            server_name,
+            transcript,
+            tls_transcript,
+            transcript_commitments,
+        ))
+    };
+    tokio::pin!(setup);
+
+    // Race setup against the driver. The driver only finishes early when the
+    // connection died under the session (e.g. a health probe that connected
+    // and immediately closed) — a protocol request already submitted to it
+    // may then never resolve, so fail instead of pending forever.
+    let (server_name, transcript, tls_transcript, transcript_commitments) = tokio::select! {
+        biased;
+        res = &mut setup => res?,
+        driver_res = driver_task.handle_mut() => {
+            return Err(driver_finished_early(driver_res));
         }
     };
 
-    let verifier = verifier.run().await.map_err(|e| Error::MpcTlsFailed {
-        detail: format!("run: {e}"),
-    })?;
-
-    let tls_transcript = verifier.tls_transcript().clone();
-
-    let verifier = verifier.verify().await.map_err(|e| Error::MpcTlsFailed {
-        detail: format!("verify: {e}"),
-    })?;
-    if !verifier.request().server_identity() {
-        verifier
-            .reject(Some("expecting server identity"))
-            .await
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("reject: {e}"),
-            })?;
-        return Err(Error::MpcTlsFailed {
-            detail: "no server identity".into(),
-        });
-    }
-
-    let (output, verifier) =
-        verifier.accept().await.map_err(|e| Error::MpcTlsFailed {
-            detail: format!("accept verify: {e}"),
-        })?;
-
-    let VerifierOutput {
-        server_name,
-        transcript,
-        transcript_commitments,
-        ..
-    } = output;
-    let server_name = server_name.ok_or_else(|| Error::MpcTlsFailed {
-        detail: "server name not revealed".into(),
-    })?;
-    let transcript = transcript.ok_or_else(|| Error::MpcTlsFailed {
-        detail: "transcript not revealed".into(),
-    })?;
-    let ServerName::Dns(ref name) = server_name;
-    info!("Verified server: {}", name.as_str());
-
-    verifier.close().await.map_err(|e| Error::MpcTlsFailed {
-        detail: format!("verifier close: {e}"),
-    })?;
-    handle.close();
     let recovered_compat: Compat<T> = driver_task
+        .into_inner()
         .await
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),

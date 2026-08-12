@@ -29,7 +29,13 @@ hyper-util.workspace = true
 libid-transcript.workspace = true
 thiserror.workspace = true
 tlsn.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util"] }
+# `macros` is for `tokio::select!`, racing session setup against the driver.
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
 tokio-util.workspace = true
 tracing.workspace = true
 webpki-root-certs.workspace = true
+
+[dev-dependencies]
+# The driver-task leak regression test builds its own runtime so
+# `Runtime::metrics().num_alive_tasks()` counts only tasks the crate spawned.
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
