@@ -8,7 +8,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # The real floor, inherited from dyaka, and it is not arbitrary:
 #   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
@@ -21,10 +21,10 @@ repository = "https://github.com/libid-org/libid-rs"
 [workspace.dependencies]
 # Intra-workspace crates. Path + version so the publishable subset can be
 # released to crates.io while local builds resolve in-tree.
-libid-crypto = { path = "crates/libid-crypto", version = "0.1.0" }
-libid-signer = { path = "crates/libid-signer", version = "0.1.0" }
-libid-transcript = { path = "crates/libid-transcript", version = "0.1.0" }
-libid-attestations = { path = "crates/libid-attestations", version = "0.1.0" }
+libid-crypto = { path = "crates/libid-crypto", version = "0.2.0" }
+libid-signer = { path = "crates/libid-signer", version = "0.2.0" }
+libid-transcript = { path = "crates/libid-transcript", version = "0.2.0" }
+libid-attestations = { path = "crates/libid-attestations", version = "0.2.0" }
 
 alloy = { version = "1", default-features = false }
 alloy-primitives = { version = "1", features = ["serde"] }
