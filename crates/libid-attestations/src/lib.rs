@@ -274,7 +274,7 @@ mod tests {
 
     /// Regression: backend digest = abi.encode(userAddr, walletAddr, root, ts).
     #[test]
-    fn identity_backend_digest_known_vector() {
+    fn backend_digest_known_vector() {
         let user_address = [0xABu8; 20];
         let wallet_address = [0xCDu8; 20];
         let transcript_root = [0x01u8; 32];
