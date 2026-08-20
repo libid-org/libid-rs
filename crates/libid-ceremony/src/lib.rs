@@ -17,6 +17,8 @@
 pub mod attestation;
 pub mod authorization;
 pub mod pkce;
+pub mod profile;
+pub mod token_exchange;
 
 pub use attestation::{
     AttestationError,
