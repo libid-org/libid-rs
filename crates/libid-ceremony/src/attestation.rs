@@ -419,6 +419,30 @@ mod tests {
         }
     }
 
+    /// The exact bytes `solidity/contracts/ceremony/test/CeremonyAttestation.t.sol`
+    /// decodes. Both sides carry this fixture, so a change to either encoder
+    /// breaks loudly here rather than diverging quietly and rejecting every
+    /// genuine attestation on chain.
+    const CROSS_LANGUAGE_FIXTURE: &str = "f1b67c286f7f90224eb4661a5922406b5092042b9515e4e9e448ec1d4f55b352\
+7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83\
+e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
+4930142f5283d4a8eab0d24c588f00b21213ae2a47e7ed6c1dc6a57044f1655d\
+0000000069800e800000003c00000028000200000000000000146161616161616161616161616161616161616161\
+000000280000003c62626262626262626262626262626262626262620001000000140000002807070707070707070707070707070707070707070707070707070707070707070001000000000000000a6363636363636363636300010000000a000000280909090909090909090909090909090909090909090909090909090909090909";
+
+    const CROSS_LANGUAGE_DIGEST: &str =
+        "511d91f8a3c13c1824fd1d3e7c011caf09f2f0763f1ede5c786839592ae8d252";
+
+    #[test]
+    fn agrees_with_the_solidity_decoder() {
+        let encoded = sample().encode().unwrap();
+        assert_eq!(hex::encode(&encoded), CROSS_LANGUAGE_FIXTURE);
+        assert_eq!(
+            hex::encode(sample().digest().unwrap()),
+            CROSS_LANGUAGE_DIGEST
+        );
+    }
+
     #[test]
     fn round_trips() {
         let data = sample();
