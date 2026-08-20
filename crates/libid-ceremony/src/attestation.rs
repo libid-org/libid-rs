@@ -114,6 +114,24 @@ pub enum AttestationError {
         from: u32,
         to: u32,
     },
+    #[error("spans of the {direction} direction overlap at {at}")]
+    SpansOverlap { direction: &'static str, at: u32 },
+    #[error("the {direction} direction holds {count} commitments, but this request commits exactly one credential")]
+    NotOneCommitment {
+        direction: &'static str,
+        count: usize,
+    },
+    #[error("the revealed {direction} bytes carry an obsolete line fold at {at}")]
+    ObsoleteLineFold { direction: &'static str, at: usize },
+    #[error(
+        "the revealed {direction} bytes hold {count} authorization header lines, not one"
+    )]
+    NotOneAuthorizationHeader {
+        direction: &'static str,
+        count: usize,
+    },
+    #[error("the committed range of the {direction} direction is not framed by an authorization header line")]
+    BadBearerFraming { direction: &'static str },
 }
 
 /// Derive a 32-byte tag from a libID-namespaced ASCII string.
@@ -348,6 +366,14 @@ impl DirectionBlock {
 
         let mut at = 0u32;
         for (start, end) in spans {
+            // Overlap is `validate`'s job, but a caller may hand-build a block
+            // and skip it. Naming it here beats reporting a backwards gap.
+            if start < at {
+                return Err(AttestationError::SpansOverlap {
+                    direction,
+                    at: start,
+                });
+            }
             if start != at {
                 return Err(AttestationError::CoverageGap {
                     direction,
@@ -365,6 +391,69 @@ impl DirectionBlock {
             });
         }
         Ok(())
+    }
+}
+
+/// `\r\nauthorization: Bearer ` -- the raw bytes REQ-COMMON-40 requires
+/// immediately before the committed range.
+pub const BEARER_PREFIX: &[u8] = b"\r\nauthorization: Bearer ";
+/// The raw bytes REQ-COMMON-40 requires immediately after it.
+pub const BEARER_SUFFIX: &[u8] = b"\r\n";
+/// The normalized, line-anchored needle REQ-COMMON-39 counts.
+pub const AUTHORIZATION_NEEDLE: &[u8] = b"\r\nauthorization:bearer";
+
+/// Lowercase ASCII and drop every space and horizontal tab, keeping CR and LF
+/// (REQ-COMMON-39).
+///
+/// HTTP field names and the auth-scheme token are case-insensitive and the
+/// colon admits optional whitespace, so a literal search over raw bytes is
+/// evadable. Removing only bytes absent from the needle can create a spurious
+/// match, which over-rejects and is safe, but can never hide a real one.
+/// Keeping CR and LF is what makes the needle count header lines rather than
+/// any substring.
+fn normalize_header_bytes(raw: &[u8]) -> Vec<u8> {
+    raw.iter()
+        .filter(|b| **b != b' ' && **b != b'\t')
+        .map(|b| b.to_ascii_lowercase())
+        .collect()
+}
+
+/// Read `[from, to)` of the transcript out of the revealed ranges, or `None`
+/// if any byte of it is not revealed.
+fn revealed_slice(block: &DirectionBlock, from: usize, to: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(to.checked_sub(from)?);
+    let mut at = from;
+    while at < to {
+        let range = block
+            .revealed
+            .iter()
+            .find(|r| (r.start as usize) <= at && at < (r.end as usize))?;
+        let offset = at - range.start as usize;
+        let take = (range.bytes.len() - offset).min(to - at);
+        out.extend_from_slice(&range.bytes[offset..offset + take]);
+        at += take;
+    }
+    Some(out)
+}
+
+fn count_needle(haystack: &[u8]) -> usize {
+    if haystack.len() < AUTHORIZATION_NEEDLE.len() {
+        return 0;
+    }
+    haystack
+        .windows(AUTHORIZATION_NEEDLE.len())
+        .filter(|w| *w == AUTHORIZATION_NEEDLE)
+        .count()
+}
+
+impl DirectionBlock {
+    /// Concatenate the revealed bytes in offset order.
+    fn revealed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for range in &self.revealed {
+            out.extend_from_slice(&range.bytes);
+        }
+        out
     }
 }
 
@@ -414,6 +503,93 @@ impl AttestedData {
         }
         decoded.validate()?;
         Ok(decoded)
+    }
+
+    /// Every check REQ-COMMON-35, -39 and -40 require of an identity-session
+    /// request that commits a credential in an HTTP `Authorization` header.
+    ///
+    /// At launch that is X's `/2/users/me` request and GitHub's `/user`
+    /// request, and nothing else. A credential committed in a request body is
+    /// a different case with its own rules, and REQ-COMMON-43 forbids applying
+    /// these three to it -- GitHub's token exchange commits `client_secret` in
+    /// a form body, so demanding a CRLF-framed header around that range would
+    /// reject every valid exchange.
+    ///
+    /// The three are one call because they are one property, and because two
+    /// of them are worthless alone. The uniqueness scan counts the needle
+    /// across REVEALED bytes only, so a byte covered by nothing is a byte it
+    /// never reads: without coverage a prover hides a second authorization
+    /// header in a gap, the count stays at one, and the platform honours
+    /// whichever header it likes. Coverage is what makes the scan complete.
+    ///
+    /// Returns the committed bearer range, which the Platform Verifier then
+    /// matches against the circuit's identity-bearer public input.
+    pub fn require_bearer_header_request(
+        &self,
+        direction: &'static str,
+        block: &DirectionBlock,
+        length: u32,
+    ) -> Result<RangeCommitment, AttestationError> {
+        // One committed range, so "the committed range" of REQ-COMMON-35 and
+        // REQ-COMMON-40 and the commitment the circuit opens are the same
+        // object. REQ-COMMON-60 permits several per direction, and nothing
+        // else here would tie the framed range to the proved one.
+        if block.commitments.len() != 1 {
+            return Err(AttestationError::NotOneCommitment {
+                direction,
+                count: block.commitments.len(),
+            });
+        }
+        let commitment = block.commitments[0].clone();
+
+        block.require_exact_coverage(direction, length)?;
+
+        let revealed = block.revealed_bytes();
+
+        // Obsolete line folding is illegal in HTTP/1.1, and it defeats the
+        // needle: `authorization:\r\n Bearer x` normalizes to
+        // `authorization:\r\nbearer`, because normalization strips the space
+        // but keeps the CRLF that the fold introduced. The header is then not
+        // counted, and a server that honours the fold authenticates with it.
+        for i in 0..revealed.len().saturating_sub(2) {
+            if revealed[i] == b'\r'
+                && revealed[i + 1] == b'\n'
+                && (revealed[i + 2] == b' ' || revealed[i + 2] == b'\t')
+            {
+                return Err(AttestationError::ObsoleteLineFold { direction, at: i });
+            }
+        }
+
+        // Count over each region separately rather than over a concatenation,
+        // so joining the two cannot manufacture a match at the seam.
+        let mut count = 0;
+        for range in &block.revealed {
+            count += count_needle(&normalize_header_bytes(&range.bytes));
+        }
+        if count != 1 {
+            return Err(AttestationError::NotOneAuthorizationHeader { direction, count });
+        }
+
+        // Framing, on RAW bytes at known offsets. Two fixed comparisons make
+        // the committed range one header line's value by construction, so the
+        // credential cannot be hidden inside another header's value.
+        let before_end = commitment.start as usize;
+        let prefix_start = before_end.checked_sub(BEARER_PREFIX.len());
+        let ok_prefix = match prefix_start {
+            Some(from) => {
+                revealed_slice(block, from, before_end) == Some(BEARER_PREFIX.to_vec())
+            }
+            None => false,
+        };
+        let after_start = commitment.end as usize;
+        let ok_suffix =
+            revealed_slice(block, after_start, after_start + BEARER_SUFFIX.len())
+                == Some(BEARER_SUFFIX.to_vec());
+        if !ok_prefix || !ok_suffix {
+            return Err(AttestationError::BadBearerFraming { direction });
+        }
+
+        Ok(commitment)
     }
 
     /// `keccak256(attestedData)` -- the only preimage the notary signs
@@ -692,5 +868,199 @@ e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
         moved.sent.revealed[0].bytes.pop();
         moved.sent.commitments[0].start = 19;
         assert_ne!(moved.digest().unwrap(), sample().digest().unwrap());
+    }
+
+    // --- The identity-session request checks -------------------------------
+
+    const BEARER: &[u8] = b"AAAAbbbbCCCCdddd";
+
+    /// A real `/2/users/me` request: four headers, the bearer committed, every
+    /// other byte revealed, tiled exactly.
+    fn identity_request(
+        extra_header: &str,
+        bearer_prefix: &str,
+    ) -> (DirectionBlock, u32) {
+        let head = format!(
+            "GET /2/users/me HTTP/1.1\r\naccept: application/json\r\nhost: api.x.com\r\n{extra_header}{bearer_prefix}"
+        );
+        let tail = "\r\nconnection: close\r\n\r\n";
+        let start = head.len() as u32;
+        let end = start + BEARER.len() as u32;
+        let length = end + tail.len() as u32;
+        (
+            DirectionBlock {
+                revealed: vec![
+                    RevealedRange {
+                        start: 0,
+                        end: start,
+                        bytes: head.into_bytes(),
+                    },
+                    RevealedRange {
+                        start: end,
+                        end: length,
+                        bytes: tail.as_bytes().to_vec(),
+                    },
+                ],
+                commitments: vec![RangeCommitment {
+                    start,
+                    end,
+                    commitment: [5u8; 32],
+                }],
+            },
+            length,
+        )
+    }
+
+    fn honest() -> (DirectionBlock, u32) {
+        identity_request("", "\r\nauthorization: Bearer ")
+    }
+
+    fn check(
+        block: &DirectionBlock,
+        length: u32,
+    ) -> Result<RangeCommitment, AttestationError> {
+        let mut data = sample();
+        data.sent = block.clone();
+        data.sent_transcript_length = length;
+        data.require_bearer_header_request("sent", block, length)
+    }
+
+    #[test]
+    fn accepts_an_honest_identity_request() {
+        let (block, length) = honest();
+        let commitment = check(&block, length).expect("an honest request must verify");
+        assert_eq!(commitment.commitment, [5u8; 32]);
+    }
+
+    #[test]
+    fn rejects_a_second_authorization_header() {
+        // The plain form: a planted header in revealed bytes. Coverage forces
+        // it to be revealed, and the scan counts two.
+        let (block, length) = identity_request(
+            "authorization: Bearer stolen\r\n",
+            "\r\nauthorization: Bearer ",
+        );
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::NotOneAuthorizationHeader { count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_case_and_whitespace_evaded_second_header() {
+        // Field names and the scheme token are case-insensitive and the colon
+        // admits whitespace, so a literal search would miss this one.
+        let (block, length) = identity_request(
+            "AuThOrIzAtIoN:\tBeArEr stolen\r\n",
+            "\r\nauthorization: Bearer ",
+        );
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::NotOneAuthorizationHeader { count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_obsolete_line_fold() {
+        // The gap a security review found: `authorization:\r\n Bearer x`
+        // normalizes to `authorization:\r\nbearer`, so the needle does not
+        // match and the header is never counted. A server honouring the fold
+        // would authenticate with it.
+        let (block, length) = identity_request(
+            "authorization:\r\n Bearer stolen\r\n",
+            "\r\nauthorization: Bearer ",
+        );
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::ObsoleteLineFold { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_request_with_no_authorization_header_at_all() {
+        let (block, length) = identity_request("", "\r\nx-other: ");
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::NotOneAuthorizationHeader { count: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_gap_the_scan_would_never_read() {
+        // This is why the three are one call. Open a gap and the hidden bytes
+        // are not scanned at all.
+        let (mut block, length) = honest();
+        block.revealed[0].end -= 1;
+        block.revealed[0].bytes.pop();
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::CoverageGap { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_commitment_that_is_not_the_header_value() {
+        // Framing on its own. The authorization header here is whole and
+        // revealed, so the needle counts once and coverage is exact -- but the
+        // committed range sits in the `host` header instead. Without
+        // REQ-COMMON-40 nothing would notice that the proved commitment and
+        // the credential are different objects.
+        let head = "GET /2/users/me HTTP/1.1\r\naccept: application/json\r\n\
+authorization: Bearer TOKEN123\r\nhost: ";
+        let committed = "api.";
+        let tail = "x.com\r\nconnection: close\r\n\r\n";
+        let start = head.len() as u32;
+        let end = start + committed.len() as u32;
+        let length = end + tail.len() as u32;
+        let block = DirectionBlock {
+            revealed: vec![
+                RevealedRange {
+                    start: 0,
+                    end: start,
+                    bytes: head.as_bytes().to_vec(),
+                },
+                RevealedRange {
+                    start: end,
+                    end: length,
+                    bytes: tail.as_bytes().to_vec(),
+                },
+            ],
+            commitments: vec![RangeCommitment {
+                start,
+                end,
+                commitment: [5u8; 32],
+            }],
+        };
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::BadBearerFraming { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_more_than_one_commitment() {
+        // REQ-COMMON-60 permits several per direction, but then nothing ties
+        // the framed range to the one the circuit opens.
+        let (mut block, length) = honest();
+        let extra = RangeCommitment {
+            start: 0,
+            end: 1,
+            commitment: [6u8; 32],
+        };
+        block.commitments.insert(0, extra);
+        assert!(matches!(
+            check(&block, length),
+            Err(AttestationError::NotOneCommitment { count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn coverage_names_an_overlap_rather_than_a_backwards_gap() {
+        let mut block = honest().0;
+        block.revealed[1].start -= 2;
+        assert!(matches!(
+            block.require_exact_coverage("sent", 0),
+            Err(AttestationError::SpansOverlap { .. })
+        ));
     }
 }
