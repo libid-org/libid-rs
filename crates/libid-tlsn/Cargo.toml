@@ -26,6 +26,7 @@ publish = false
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+libid-ceremony.workspace = true
 libid-transcript.workspace = true
 thiserror.workspace = true
 tlsn.workspace = true
@@ -39,3 +40,6 @@ webpki-root-certs.workspace = true
 # The driver-task leak regression test builds its own runtime so
 # `Runtime::metrics().num_alive_tasks()` counts only tasks the crate spawned.
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
+# The attested-data tests build tlsn types directly.
+rangeset = "0.4"
+serde_json.workspace = true
