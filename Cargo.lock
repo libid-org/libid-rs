@@ -3357,6 +3357,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libid-ceremony"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "libid-crypto",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "libid-crypto"
 version = "0.2.0"
 dependencies = [

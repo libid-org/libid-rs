@@ -25,6 +25,7 @@ libid-crypto = { path = "crates/libid-crypto", version = "0.2.0" }
 libid-signer = { path = "crates/libid-signer", version = "0.2.0" }
 libid-transcript = { path = "crates/libid-transcript", version = "0.2.0" }
 libid-attestations = { path = "crates/libid-attestations", version = "0.2.0" }
+libid-ceremony = { path = "crates/libid-ceremony", version = "0.2.0" }
 
 alloy = { version = "1", default-features = false }
 alloy-primitives = { version = "1", features = ["serde"] }
@@ -35,6 +36,7 @@ alloy-sol-types = "1"
 # pinned to the 1.x line so cargo unifies them with whatever alloy resolves.
 aws-config = "1"
 aws-sdk-kms = "1"
+base64 = "0.22"
 hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1.1", features = ["client", "http1"] }
@@ -43,6 +45,7 @@ k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Upstream TLSNotary, same pin as dyaka. A GIT dependency: any crate that
