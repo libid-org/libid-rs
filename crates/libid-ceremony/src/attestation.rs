@@ -108,6 +108,12 @@ pub enum AttestationError {
         start: u32,
         end: u32,
     },
+    #[error("transcript bytes {from}..{to} of the {direction} direction are covered by nothing")]
+    CoverageGap {
+        direction: &'static str,
+        from: u32,
+        to: u32,
+    },
 }
 
 /// Derive a 32-byte tag from a libID-namespaced ASCII string.
@@ -315,6 +321,53 @@ impl<'a> Reader<'a> {
     }
 }
 
+impl DirectionBlock {
+    /// Require the revealed ranges and commitments to tile `[0, length)`
+    /// exactly, with no gap and no overlap (REQ-COMMON-35).
+    ///
+    /// Only for a direction whose profile demands exact coverage. The rule is
+    /// conditional: REQ-COMMON-43 withholds it from a credential committed in
+    /// a request body, which is GitHub's `client_secret`, so [`validate`] does
+    /// not apply it and a caller asks for it where the profile does.
+    ///
+    /// A gap is where a prover hides bytes. Exact coverage leaves the committed
+    /// range as the only region the verifier cannot read and makes its offset
+    /// and length follow from the ranges around it.
+    ///
+    /// [`validate`]: AttestedData::validate
+    pub fn require_exact_coverage(
+        &self,
+        direction: &'static str,
+        length: u32,
+    ) -> Result<(), AttestationError> {
+        let mut spans: Vec<(u32, u32)> =
+            Vec::with_capacity(self.revealed.len() + self.commitments.len());
+        spans.extend(self.revealed.iter().map(|r| (r.start, r.end)));
+        spans.extend(self.commitments.iter().map(|c| (c.start, c.end)));
+        spans.sort_unstable();
+
+        let mut at = 0u32;
+        for (start, end) in spans {
+            if start != at {
+                return Err(AttestationError::CoverageGap {
+                    direction,
+                    from: at,
+                    to: start,
+                });
+            }
+            at = end;
+        }
+        if at != length {
+            return Err(AttestationError::CoverageGap {
+                direction,
+                from: at,
+                to: length,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl AttestedData {
     /// Reject a shape the Platform Verifier must refuse: ranges out of order,
     /// overlapping, empty, or ending past the signed transcript length
@@ -440,6 +493,47 @@ e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
         assert_eq!(
             hex::encode(sample().digest().unwrap()),
             CROSS_LANGUAGE_DIGEST
+        );
+    }
+
+    #[test]
+    fn coverage_accepts_an_exact_tiling() {
+        let data = sample();
+        data.sent
+            .require_exact_coverage("sent", data.sent_transcript_length)
+            .expect("the sample tiles 0..20, 20..40, 40..60");
+    }
+
+    #[test]
+    fn coverage_rejects_a_gap() {
+        // `validate` accepts this on purpose: coverage is conditional under
+        // REQ-COMMON-43. The identity-session verifier is what must refuse it.
+        let mut data = sample();
+        data.sent.commitments[0].start = 21;
+        data.validate().expect("shape alone still passes");
+        assert_eq!(
+            data.sent
+                .require_exact_coverage("sent", data.sent_transcript_length),
+            Err(AttestationError::CoverageGap {
+                direction: "sent",
+                from: 20,
+                to: 21
+            })
+        );
+    }
+
+    #[test]
+    fn coverage_rejects_a_trailing_gap() {
+        // Bytes past the last range are invisible without the signed length to
+        // close them (REQ-COMMON-36).
+        let data = sample();
+        assert_eq!(
+            data.sent.require_exact_coverage("sent", 80),
+            Err(AttestationError::CoverageGap {
+                direction: "sent",
+                from: 60,
+                to: 80
+            })
         );
     }
 
