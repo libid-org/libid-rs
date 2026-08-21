@@ -14,6 +14,7 @@
 //! * [`types`] — [`EvmProof`], [`NotaryResponse`] and [`TlsHandshakeData`],
 //!   the notary's output as consumed by backends and on-chain verifiers.
 
+pub mod ceremony;
 pub mod ranges;
 pub mod types;
 pub mod wire;
