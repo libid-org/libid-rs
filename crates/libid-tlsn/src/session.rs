@@ -69,6 +69,10 @@ use tracing::{
 };
 
 use libid_transcript::{
+    ceremony::{
+        self,
+        IdShape,
+    },
     find_notary_reveal_ranges,
     find_presentation_commit_ranges,
     TlsHandshakeData,
@@ -279,6 +283,9 @@ where
             bearer_token: Some(access_token),
             user_agent: params.user_agent,
         },
+        // This flow predates the ceremony layouts and still selects the old
+        // sparse ranges. `RevealMode::Ceremony` is what a ceremony session uses.
+        RevealMode::Legacy,
         |recv| {
             let mut ranges =
                 vec![
@@ -308,6 +315,68 @@ where
 
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
+/// The reveal and commit ranges for one ceremony session, both directions.
+fn ceremony_layouts(
+    sent: &[u8],
+    recv: &[u8],
+    session: CeremonySession<'_>,
+) -> Result<(ceremony::Layout, ceremony::Layout)> {
+    let to_err = |e: ceremony::LayoutError| Error::MpcTlsFailed {
+        detail: format!("ceremony layout: {e}"),
+    };
+    Ok(match session {
+        CeremonySession::Token { secret_field } => (
+            ceremony::token_request(sent, secret_field).map_err(to_err)?,
+            ceremony::token_response(recv).map_err(to_err)?,
+        ),
+        CeremonySession::Identity {
+            id_field,
+            id_shape,
+            handle_field,
+        } => (
+            ceremony::identity_request(sent).map_err(to_err)?,
+            ceremony::identity_response(recv, id_field, id_shape, handle_field)
+                .map_err(to_err)?,
+        ),
+    })
+}
+
+/// Which session of a ceremony this is, and therefore what it discloses.
+///
+/// The layouts come from `libid_transcript::ceremony`, where the commitments
+/// are derived as the complement of the reveals so every direction tiles by
+/// construction. A direction that does not tile is refused by the Platform
+/// Verifier, so this is a correctness requirement rather than a disclosure
+/// preference: choose the wrong ranges and no honest ceremony verifies.
+#[derive(Clone, Copy, Debug)]
+pub enum CeremonySession<'a> {
+    /// X's `/2/oauth2/token`, or GitHub's token exchange when `secret_field`
+    /// names the credential ordered last in its body.
+    Token { secret_field: Option<&'a str> },
+    /// X's `/2/users/me`, or GitHub's `/user`.
+    Identity {
+        id_field: &'a str,
+        id_shape: IdShape,
+        handle_field: &'a str,
+    },
+}
+
+/// How a prover chooses its ranges.
+#[derive(Clone, Copy, Debug)]
+pub enum RevealMode<'a> {
+    /// The ceremony layouts of the specification.
+    Ceremony(CeremonySession<'a>),
+    /// The pre-ceremony selection: the request line and `Host` revealed and
+    /// committed, the whole response committed, and the caller's closure
+    /// choosing what of the response to reveal.
+    ///
+    /// Kept only until the ceremony path replaces every caller. It does NOT
+    /// tile, so an attestation produced this way is rejected by the Platform
+    /// Verifier.
+    Legacy,
+}
+
+/// The reveal and commit ranges for one ceremony session, both directions.
 /// The `compute_reveal_ranges` closure receives the full `recv` transcript
 /// data after the HTTP exchange completes and must return the byte ranges
 /// within `recv` to selectively disclose. Each range becomes a separate
@@ -321,6 +390,7 @@ where
 pub async fn prover_generic<T, F, R>(
     socket: T,
     request: &HttpRequestSpec<'_>,
+    reveal_mode: RevealMode<'_>,
     compute_reveal_ranges: R,
     on_progress: F,
 ) -> Result<ProverResult<T>>
@@ -468,7 +538,21 @@ where
         let transcript = prover.transcript().clone();
         let sent = transcript.sent();
         let recv = transcript.received();
-        let reveal_recv_ranges = compute_reveal_ranges(recv)?;
+        // The ceremony layouts derive their commitments as the complement of
+        // the reveals, so each direction tiles by construction -- which is what
+        // the Platform Verifier's coverage check demands.
+        let (sent_layout, recv_layout) = match reveal_mode {
+            RevealMode::Ceremony(session) => {
+                let (s, r) = ceremony_layouts(sent, recv, session)?;
+                (Some(s), Some(r))
+            }
+            RevealMode::Legacy => (None, None),
+        };
+
+        let reveal_recv_ranges = match &recv_layout {
+            Some(l) => l.reveal.clone(),
+            None => compute_reveal_ranges(recv)?,
+        };
 
         // Save the revealed recv segments BEFORE the transcript is moved.
         // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
@@ -478,21 +562,33 @@ where
             .map(|r| recv[r.clone()].to_vec())
             .collect();
 
-        let notary_sent_ranges = find_notary_reveal_ranges(sent);
+        let notary_sent_ranges = match &sent_layout {
+            Some(l) => l.reveal.clone(),
+            None => find_notary_reveal_ranges(sent),
+        };
 
         let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-        for range in find_presentation_commit_ranges(sent) {
+        let (sent_commits, recv_commits) = match (&sent_layout, &recv_layout) {
+            (Some(s), Some(r)) => (s.commit.clone(), r.commit.clone()),
+            _ => (
+                find_presentation_commit_ranges(sent),
+                core::iter::once(0..recv.len()).collect(),
+            ),
+        };
+        for range in sent_commits {
             tc_builder
                 .commit_sent(&range)
                 .map_err(|e| Error::MpcTlsFailed {
                     detail: format!("commit sent: {e}"),
                 })?;
         }
-        tc_builder
-            .commit_recv(&(0..recv.len()))
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("commit recv: {e}"),
-            })?;
+        for range in recv_commits {
+            tc_builder
+                .commit_recv(&range)
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("commit recv: {e}"),
+                })?;
+        }
         let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
             detail: format!("transcript commit config: {e}"),
         })?;
