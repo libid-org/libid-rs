@@ -17,7 +17,11 @@
 //! the profile author.
 //!
 //! That makes these constants a cross-implementation agreement rather than a
-//! reading of the specification. A notary emitting `libid.attestation.v1` and a
+//! reading of the specification. The same goes for the `REQ-COMMON-53`/`-55`
+//! and `REQ-PLAT-61`..`-74` numbers cited below: they come from libid PR #12,
+//! which was closed without merging, so a reader will not find them on main.
+//! They are kept because the intent is to upstream these definitions under the
+//! specification's own numbering. A notary emitting `libid.attestation.v1` and a
 //! verifier pinning anything else derives a key nobody trusts and rejects every
 //! genuine attestation, with no error that says why. They must be agreed before
 //! either side ships.
