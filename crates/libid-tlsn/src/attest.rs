@@ -162,6 +162,10 @@ fn direction_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libid_transcript::ceremony::{
+        self,
+        Layout,
+    };
     use rangeset::set::RangeSet;
     use tlsn::{
         hash::TypedHash,
@@ -335,5 +339,105 @@ mod tests {
                 .unwrap(),
             "the two sessions must differ somewhere -- in the revealed range"
         );
+    }
+
+    // --- The layouts the prover selects must satisfy the verifier ----------
+
+    /// Build a session from a real transcript plus the layout the ceremony
+    /// selects for it, and check the attested data it produces TILES.
+    ///
+    /// This is the property no unit test on either side reaches on its own. The
+    /// verifier demands exact coverage; the prover chooses the ranges. If they
+    /// disagree, every check passes in isolation and no honest ceremony
+    /// verifies -- a liveness failure that only shows up in an end-to-end run.
+    fn round_trip(
+        sent: &[u8],
+        recv: &[u8],
+        sent_layout: &Layout,
+        recv_layout: &Layout,
+    ) -> AttestedData {
+        let transcript = Transcript::new(sent, recv);
+        let partial = transcript.to_partial(
+            RangeSet::from(sent_layout.reveal.clone()),
+            RangeSet::from(recv_layout.reveal.clone()),
+        );
+        let mut commitments = Vec::new();
+        for (direction, l) in [
+            (Direction::Sent, sent_layout),
+            (Direction::Received, recv_layout),
+        ] {
+            for range in &l.commit {
+                commitments.push(TranscriptCommitment::Hash(PlaintextHash {
+                    direction,
+                    idx: RangeSet::from(range.clone()),
+                    hash: hash32(1),
+                }));
+            }
+        }
+        attested_data(&partial, "api.x.com", &commitments, input()).unwrap()
+    }
+
+    #[test]
+    fn the_identity_session_layout_tiles_both_directions() {
+        let sent: &[u8] = b"GET /2/users/me HTTP/1.1\r\nhost: api.x.com\r\nauthorization: Bearer TOKENVALUE\r\nconnection: close\r\n\r\n";
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
+
+        let s = ceremony::identity_request(sent).unwrap();
+        let r = ceremony::identity_response(
+            recv,
+            "id",
+            ceremony::IdShape::JsonString,
+            "username",
+        )
+        .unwrap();
+        let data = round_trip(sent, recv, &s, &r);
+
+        data.sent
+            .require_exact_coverage("sent", data.sent_transcript_length)
+            .expect("the identity request must satisfy REQ-COMMON-35");
+        data.received
+            .require_exact_coverage("received", data.recv_transcript_length)
+            .expect("the identity response must tile too");
+
+        // And exactly one credential is hidden in the request, which is what
+        // ties the framed range to the one the circuit opens.
+        assert_eq!(data.sent.commitments.len(), 1);
+    }
+
+    #[test]
+    fn the_x_token_session_layout_tiles() {
+        let sent: &[u8] = b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"SECRETBEARER\"}";
+
+        let s = ceremony::token_request(sent, None).unwrap();
+        let r = ceremony::token_response(recv).unwrap();
+        let data = round_trip(sent, recv, &s, &r);
+
+        data.sent
+            .require_exact_coverage("sent", data.sent_transcript_length)
+            .expect("the token request must tile");
+        // X reveals its token request whole, so the verifier can see the head
+        // boundary and locate the body by the framing the server parsed.
+        assert!(data.sent.commitments.is_empty());
+        assert_eq!(data.sent.revealed.len(), 1);
+        assert_eq!(data.sent.revealed[0].start, 0);
+    }
+
+    #[test]
+    fn the_github_exchange_layout_commits_a_suffix() {
+        let sent: &[u8] = b"POST /login/oauth/access_token HTTP/1.1\r\nhost: github.com\r\n\r\nclient_id=Iv1.x&code=abc&code_verifier=xyz&client_secret=deadbeef";
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"gho_SECRET\"}";
+
+        let s = ceremony::token_request(sent, Some("client_secret")).unwrap();
+        let r = ceremony::token_response(recv).unwrap();
+        let data = round_trip(sent, recv, &s, &r);
+
+        data.sent
+            .require_exact_coverage("sent", data.sent_transcript_length)
+            .expect("the exchange must tile");
+        assert_eq!(data.sent.revealed.len(), 1);
+        assert_eq!(data.sent.commitments.len(), 1);
+        // Ordered last, so the commitment reaches the transcript end.
+        assert_eq!(data.sent.commitments[0].end, data.sent_transcript_length);
     }
 }
