@@ -10,6 +10,26 @@
 //! Every boundary is derivable from bytes that precede it, so decoding is one
 //! forward pass and two different attestations cannot share one preimage by
 //! shifting a boundary (REQ-COMMON-48).
+//!
+//! # Where these requirement numbers come from
+//!
+//! The `REQ-COMMON-47` through `REQ-COMMON-61` cited below are NOT in the
+//! published specification. They were written in libid PR #12, which defined
+//! this byte layout and was closed on 2026-08-20 without merging; PR #15 does
+//! not restore it. What survives on main is `REQ-COMMON-18`, which requires a
+//! Platform Profile to PIN the attestation format it accepts and leaves the
+//! format itself to the profile author.
+//!
+//! So this module is the definition, not a reading of one. The numbering is
+//! kept because it is the specification's own, and the intent is to upstream
+//! this layout under those identifiers -- the specification follows what the
+//! implementation needs. Until it does, a reader looking these up will not
+//! find them, and every rule they name is stated in full here.
+//!
+//! Four components must agree on these bytes: this crate, the Solidity
+//! decoder, the TypeScript mirror, and the notary that signs them. A
+//! divergence is silent -- the signature derives a key nobody trusts and every
+//! genuine attestation is rejected with no error saying why.
 
 use libid_crypto::keccak256;
 

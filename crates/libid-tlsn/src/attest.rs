@@ -5,6 +5,10 @@
 //! layering is deliberate: `libid-ceremony` owns the bytes and is publishable,
 //! this crate owns the translation and is git-only because tlsn is. Nothing
 //! above needs to know that a `RangeSet` exists.
+//!
+//! The `REQ-COMMON-56`/`-57`/`-59`/`-61` cited below are from libid PR #12,
+//! which was closed without merging. `libid_ceremony::attestation` carries the
+//! provenance note and states each rule in full.
 
 use libid_ceremony::attestation::{
     tag,
