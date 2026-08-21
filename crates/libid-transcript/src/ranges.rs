@@ -380,9 +380,9 @@ mod tests {
 
     #[test]
     fn find_json_field_range_x_tweet() {
-        let body = br#"{"data":[{"text":"@dyaka greet @bob with 1 TST","id":"123"}],"includes":{"users":[{"username":"alice"}]}}"#;
+        let body = br#"{"data":[{"text":"@libid greet @bob with 1 TST","id":"123"}],"includes":{"users":[{"username":"alice"}]}}"#;
         let range = find_json_field_range(body, "text").unwrap();
-        assert_eq!(&body[range], b"@dyaka greet @bob with 1 TST");
+        assert_eq!(&body[range], b"@libid greet @bob with 1 TST");
 
         let range = find_json_field_range(body, "username").unwrap();
         assert_eq!(&body[range], b"alice");
