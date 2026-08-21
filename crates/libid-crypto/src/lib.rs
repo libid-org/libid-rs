@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn double_hash_leaf_str_and_bytes_prefixes_agree() {
-        // The dyaka call sites pass `"recv:"`, the jwks prover passed
+        // The original call sites pass `"recv:"`, the jwks prover passed
         // `b"recv:"` — both must hash identically now that they share one
         // implementation.
         assert_eq!(
