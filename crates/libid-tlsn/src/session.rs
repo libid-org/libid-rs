@@ -139,19 +139,6 @@ fn driver_finished_early<T, E: std::fmt::Display>(
     Error::MpcTlsFailed { detail }
 }
 
-/// Sub-steps within the MPC-TLS prover phase, reported via callback.
-#[derive(Debug, Clone, Copy)]
-pub enum ProverStep {
-    /// MPC-TLS session established with notary.
-    MpcSetupComplete,
-    /// TLS handshake completed via MPC.
-    TlsHandshakeComplete,
-    /// Platform user data fetched over MPC-TLS.
-    PlatformDataFetched,
-    /// MPC proof finalized.
-    MpcProofFinalized,
-}
-
 /// The WebPKI root store both sides validate server certificates against.
 pub fn root_store() -> RootCertStore {
     RootCertStore {
@@ -216,25 +203,6 @@ pub struct VerifierResult<T> {
     pub recovered_io: T,
 }
 
-/// The HTTPS request the prover performs over MPC-TLS.
-#[derive(Debug, Clone, Copy)]
-pub struct HttpRequestSpec<'a> {
-    /// API host (SNI and Host header), e.g. `"api.x.com"`.
-    pub api_host: &'a str,
-    /// Request path, e.g. `"/2/users/me"`.
-    pub path: &'a str,
-    /// HTTP method, e.g. `"GET"`.
-    pub method: &'a str,
-    /// Optional request body; when set, `Content-Type: application/json` is
-    /// added.
-    pub body: Option<&'a str>,
-    /// Optional bearer token, sent as `Authorization: Bearer <token>`. `None`
-    /// for unauthenticated endpoints (e.g. a public JWKS fetch).
-    pub bearer_token: Option<&'a str>,
-    /// User-Agent header value.
-    pub user_agent: &'a str,
-}
-
 /// Parameters for the user-info prover flow ([`prover`]).
 #[derive(Debug, Clone, Copy)]
 pub struct UserInfoParams<'a> {
@@ -256,28 +224,38 @@ pub struct UserInfoParams<'a> {
 /// Run the MPC-TLS prover to fetch user data from a platform API, revealing
 /// the username snippet (and the id snippet when configured).
 #[instrument(skip_all, fields(api_host = params.api_host))]
-pub async fn prover<T, F>(
+pub async fn prover<T>(
     socket: T,
     access_token: &str,
     params: &UserInfoParams<'_>,
-    on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
-    F: Fn(ProverStep),
 {
     let username_field = params.username_field;
     let id_field = params.id_field;
+    // The headers this flow sends, stated here rather than injected by the
+    // library. A notarized request is bytes a verifier compares against a
+    // profile, so whoever knows the profile writes them.
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!(
+            "https://{}{}",
+            params.api_host, params.user_info_path
+        ))
+        .header("Host", params.api_host)
+        .header("Connection", "close")
+        .header("Accept", "application/json")
+        .header("User-Agent", params.user_agent)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .body(http_body_util::Full::new(Bytes::new()))
+        .map_err(|e| Error::MpcTlsFailed {
+            detail: format!("request build: {e}"),
+        })?;
+
     prover_generic(
         socket,
-        &HttpRequestSpec {
-            api_host: params.api_host,
-            path: params.user_info_path,
-            method: "GET",
-            body: None,
-            bearer_token: Some(access_token),
-            user_agent: params.user_agent,
-        },
+        request,
         // This flow predates the ceremony layouts and still selects the old
         // sparse ranges: the request line and `Host` revealed, everything else
         // of the response committed whole. It does NOT tile, so what it
@@ -313,7 +291,6 @@ where
                 },
             ))
         },
-        on_progress,
     )
     .await
 }
@@ -336,19 +313,28 @@ where
 /// Each revealed range becomes a separate Merkle leaf in the notary's
 /// transcript tree. [`libid_transcript::compute_field_reveal_range`] and
 /// friends locate JSON field values in a response body.
-#[instrument(skip_all, fields(api_host = request.api_host))]
-pub async fn prover_generic<T, F, S>(
+#[instrument(skip_all)]
+pub async fn prover_generic<T, S>(
     socket: T,
-    request: &HttpRequestSpec<'_>,
+    request: hyper::Request<http_body_util::Full<Bytes>>,
     select_layout: S,
-    on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
-    F: Fn(ProverStep),
     S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
 {
-    let api_host = request.api_host;
+    // SNI and the TCP peer come from the request's own authority. A caller
+    // that set no host has not said which server it means to reach.
+    let api_host = request
+        .uri()
+        .host()
+        .ok_or_else(|| Error::MpcTlsFailed {
+            detail: "request URI carries no host".into(),
+        })?
+        .to_string();
+    let api_host = api_host.as_str();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -380,7 +366,6 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("commit: {e}"),
             })?;
-        on_progress(ProverStep::MpcSetupComplete);
 
         info!("Connecting to {} API", api_host);
         let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
@@ -402,7 +387,6 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("connect: {e}"),
             })?;
-        on_progress(ProverStep::TlsHandshakeComplete);
 
         let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
         let (mut sender, conn) =
@@ -415,41 +399,10 @@ where
         // exchange; the guard reaps it if the session bails out first.
         let _conn_task = AbortOnDrop::new(tokio::spawn(conn));
 
-        let http_request = {
-            let mut builder = hyper::Request::builder()
-                .method(request.method)
-                .uri(request.path)
-                .header("Host", api_host)
-                .header("Connection", "close")
-                .header("Accept", "application/json")
-                .header("User-Agent", request.user_agent);
-            if let Some(token) = request.bearer_token {
-                builder = builder.header("Authorization", format!("Bearer {}", token));
-            }
-            if request.body.is_some() {
-                builder = builder.header("Content-Type", "application/json");
-            }
-            if let Some(post_body) = request.body {
-                builder
-                    .body(http_body_util::Full::new(Bytes::from(
-                        post_body.to_string(),
-                    )))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            } else {
-                builder
-                    .body(http_body_util::Full::new(Bytes::new()))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            }
-        };
-
-        info!("Sending {} {}", request.method, request.path);
+        info!("Sending {method} {path}");
         let response =
             sender
-                .send_request(http_request)
+                .send_request(request)
                 .await
                 .map_err(|e| Error::MpcTlsFailed {
                     detail: format!("send request: {e}"),
@@ -473,7 +426,6 @@ where
             });
         }
         info!("Response: {} bytes", body.len());
-        on_progress(ProverStep::PlatformDataFetched);
 
         let mut prover = prover_task
             .into_inner()
@@ -556,7 +508,6 @@ where
                 detail: format!("prove: {e}"),
             })?;
         info!("MPC-TLS proof complete");
-        on_progress(ProverStep::MpcProofFinalized);
 
         let tls_transcript = prover.tls_transcript().clone();
         let handshake = extract_handshake_data(&tls_transcript)?;

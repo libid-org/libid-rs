@@ -60,15 +60,24 @@
 
 mod session;
 
+pub use http_body_util::Full as HttpBody;
+/// The request `prover_generic` sends, and the pieces to build one.
+///
+/// Re-exported so a caller states its own headers without taking a direct
+/// dependency on the HTTP crates this uses. A notarized request is bytes a
+/// verifier compares against a profile, so the party that knows the profile
+/// writes them -- this library injects none.
+pub use hyper::{
+    body::Bytes,
+    Request as HttpRequest,
+};
 pub use session::{
     extract_handshake_data,
     prover,
     prover_generic,
     root_store,
     verifier,
-    HttpRequestSpec,
     ProverResult,
-    ProverStep,
     UserInfoParams,
     VerifierResult,
     MAX_RECV_DATA,
