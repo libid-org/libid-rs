@@ -313,6 +313,20 @@ where
 /// Each revealed range becomes a separate Merkle leaf in the notary's
 /// transcript tree. [`libid_transcript::compute_field_reveal_range`] and
 /// friends locate JSON field values in a response body.
+///
+/// # Following a session
+///
+/// This is slow and worth watching, so every phase boundary is a `tracing`
+/// event inside this function's span: MPC-TLS setup complete, TLS handshake
+/// complete, response received, proof complete. A caller that wants to show
+/// progress subscribes to them.
+///
+/// There used to be a typed `Fn(ProverStep)` callback instead, and it was
+/// removed because both callers in the workspace passed `|_| {}`. `tracing` is
+/// already a dependency and needs no parameter threaded through the signature.
+/// If a caller ever needs to drive something typed off these phases -- a
+/// progress bar rather than a log -- the callback is the better answer and
+/// should come back; log text is not an interface.
 #[instrument(skip_all)]
 pub async fn prover_generic<T, S>(
     socket: T,
@@ -366,6 +380,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("commit: {e}"),
             })?;
+        info!("MPC-TLS setup complete");
 
         info!("Connecting to {} API", api_host);
         let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
@@ -387,6 +402,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("connect: {e}"),
             })?;
+        info!("TLS handshake complete");
 
         let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
         let (mut sender, conn) =
