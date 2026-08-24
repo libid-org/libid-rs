@@ -171,6 +171,39 @@ pub fn extract_handshake_data(
     })
 }
 
+/// A phase boundary of a prover session, in the order they occur.
+///
+/// Reported through `on_progress` so a caller can drive something typed off
+/// them -- a progress indicator for a browser waiting out a server-side
+/// exchange, which takes seconds. The same four boundaries are `tracing`
+/// events for operators; this is the interface, because log text is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProverStep {
+    /// MPC-TLS session established with the notary.
+    MpcSetupComplete,
+    /// TLS handshake completed through it.
+    TlsHandshakeComplete,
+    /// The platform answered.
+    PlatformDataFetched,
+    /// The proof is finalised and the session can be closed.
+    MpcProofFinalized,
+}
+
+impl ProverStep {
+    /// How far through the session this boundary is, in `(0, 1]`.
+    ///
+    /// The phases are not equal in wall-clock time -- setup and proving
+    /// dominate -- so this is a position, not an estimate of remaining time.
+    pub fn fraction(self) -> f32 {
+        match self {
+            Self::MpcSetupComplete => 0.25,
+            Self::TlsHandshakeComplete => 0.5,
+            Self::PlatformDataFetched => 0.75,
+            Self::MpcProofFinalized => 1.0,
+        }
+    }
+}
+
 /// Result from the MPC-TLS prover.
 pub struct ProverResult<T> {
     /// The HTTP response body from the platform API (decoded, headers stripped).
@@ -291,6 +324,8 @@ where
                 },
             ))
         },
+        // This flow goes at cutover and nothing watches it run.
+        |_| {},
     )
     .await
 }
@@ -316,26 +351,27 @@ where
 ///
 /// # Following a session
 ///
-/// This is slow and worth watching, so every phase boundary is a `tracing`
-/// event inside this function's span: MPC-TLS setup complete, TLS handshake
-/// complete, response received, proof complete. A caller that wants to show
-/// progress subscribes to them.
+/// This is slow -- setup and proving dominate -- so every phase boundary is
+/// reported twice, to two different audiences. A `tracing` event inside this
+/// function's span, for whoever reads the logs; and [`ProverStep`] through
+/// `on_progress`, for a caller driving something typed off it.
 ///
-/// There used to be a typed `Fn(ProverStep)` callback instead, and it was
-/// removed because both callers in the workspace passed `|_| {}`. `tracing` is
-/// already a dependency and needs no parameter threaded through the signature.
-/// If a caller ever needs to drive something typed off these phases -- a
-/// progress bar rather than a log -- the callback is the better answer and
-/// should come back; log text is not an interface.
+/// The browser has its own progress from the tlsn wasm prover and never
+/// reaches this function. The caller this exists for is a server that
+/// notarizes on someone's behalf -- the GitHub Token-Exchange Service, whose
+/// HTTP caller waits out the whole session -- and which cannot report phases
+/// by parsing log lines.
 #[instrument(skip_all)]
-pub async fn prover_generic<T, S>(
+pub async fn prover_generic<T, S, F>(
     socket: T,
     request: hyper::Request<http_body_util::Full<Bytes>>,
     select_layout: S,
+    on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
     S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
+    F: Fn(ProverStep),
 {
     // SNI and the TCP peer come from the request's own authority. A caller
     // that set no host has not said which server it means to reach.
@@ -381,6 +417,7 @@ where
                 detail: format!("commit: {e}"),
             })?;
         info!("MPC-TLS setup complete");
+        on_progress(ProverStep::MpcSetupComplete);
 
         info!("Connecting to {} API", api_host);
         let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
@@ -403,6 +440,7 @@ where
                 detail: format!("connect: {e}"),
             })?;
         info!("TLS handshake complete");
+        on_progress(ProverStep::TlsHandshakeComplete);
 
         let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
         let (mut sender, conn) =
@@ -442,6 +480,7 @@ where
             });
         }
         info!("Response: {} bytes", body.len());
+        on_progress(ProverStep::PlatformDataFetched);
 
         let mut prover = prover_task
             .into_inner()
@@ -524,6 +563,7 @@ where
                 detail: format!("prove: {e}"),
             })?;
         info!("MPC-TLS proof complete");
+        on_progress(ProverStep::MpcProofFinalized);
 
         let tls_transcript = prover.tls_transcript().clone();
         let handshake = extract_handshake_data(&tls_transcript)?;

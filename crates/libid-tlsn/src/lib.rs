@@ -78,6 +78,7 @@ pub use session::{
     root_store,
     verifier,
     ProverResult,
+    ProverStep,
     UserInfoParams,
     VerifierResult,
     MAX_RECV_DATA,
