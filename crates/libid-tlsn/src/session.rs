@@ -6,6 +6,7 @@ use hyper::{
     StatusCode,
 };
 use hyper_util::rt::TokioIo;
+use libid_transcript::ceremony::Layout;
 use std::future::IntoFuture;
 use tlsn::{
     attestation::{
@@ -69,10 +70,6 @@ use tracing::{
 };
 
 use libid_transcript::{
-    ceremony::{
-        self,
-        IdShape,
-    },
     find_notary_reveal_ranges,
     find_presentation_commit_ranges,
     TlsHandshakeData,
@@ -82,8 +79,6 @@ use crate::{
     Error,
     Result,
 };
-
-use std::ops::Range;
 
 /// Maximum bytes the prover may send in the MPC-TLS session (4 KB). The
 /// verifier rejects sessions configured above this.
@@ -284,10 +279,10 @@ where
             user_agent: params.user_agent,
         },
         // This flow predates the ceremony layouts and still selects the old
-        // sparse ranges, which is why it cannot produce a ceremony attestation.
-        // It goes at cutover; `RevealMode::Ceremony` is what replaces it.
-        RevealMode::CallerSelected,
-        |recv| {
+        // sparse ranges: the request line and `Host` revealed, everything else
+        // of the response committed whole. It does NOT tile, so what it
+        // produces is not a ceremony attestation. It goes at cutover.
+        |sent, recv| {
             let mut ranges =
                 vec![
                     libid_transcript::compute_field_snippet_range(recv, username_field)
@@ -307,7 +302,16 @@ where
                     ranges.push(range);
                 }
             }
-            Ok(ranges)
+            Ok((
+                Layout {
+                    reveal: find_notary_reveal_ranges(sent),
+                    commit: find_presentation_commit_ranges(sent),
+                },
+                Layout {
+                    reveal: ranges,
+                    commit: core::iter::once(0..recv.len()).collect(),
+                },
+            ))
         },
         on_progress,
     )
@@ -316,95 +320,33 @@ where
 
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
-/// The reveal and commit ranges for one ceremony session, both directions.
-fn ceremony_layouts(
-    sent: &[u8],
-    recv: &[u8],
-    session: CeremonySession<'_>,
-) -> Result<(ceremony::Layout, ceremony::Layout)> {
-    let to_err = |e: ceremony::LayoutError| Error::MpcTlsFailed {
-        detail: format!("ceremony layout: {e}"),
-    };
-    Ok(match session {
-        CeremonySession::Token { secret_field } => (
-            ceremony::token_request(sent, secret_field).map_err(to_err)?,
-            ceremony::token_response(recv).map_err(to_err)?,
-        ),
-        CeremonySession::Identity {
-            id_field,
-            id_shape,
-            handle_field,
-        } => (
-            ceremony::identity_request(sent).map_err(to_err)?,
-            ceremony::identity_response(recv, id_field, id_shape, handle_field)
-                .map_err(to_err)?,
-        ),
-    })
-}
-
-/// Which session of a ceremony this is, and therefore what it discloses.
+/// `select_layout` receives both complete transcripts once the HTTP exchange
+/// finishes and returns, for each direction, what to reveal and what to commit.
+/// The prover chooses that -- it is the party holding the session keys, and
+/// nobody above it can decide on its behalf.
 ///
-/// The layouts come from `libid_transcript::ceremony`, where the commitments
-/// are derived as the complement of the reveals so every direction tiles by
-/// construction. A direction that does not tile is refused by the Platform
-/// Verifier, so this is a correctness requirement rather than a disclosure
-/// preference: choose the wrong ranges and no honest ceremony verifies.
-#[derive(Clone, Copy, Debug)]
-pub enum CeremonySession<'a> {
-    /// X's `/2/oauth2/token`, or GitHub's token exchange when `secret_field`
-    /// names the credential ordered last in its body.
-    Token { secret_field: Option<&'a str> },
-    /// X's `/2/users/me`, or GitHub's `/user`.
-    Identity {
-        id_field: &'a str,
-        id_shape: IdShape,
-        handle_field: &'a str,
-    },
-}
-
-/// How a prover chooses its ranges.
-#[derive(Clone, Copy, Debug)]
-pub enum RevealMode<'a> {
-    /// The ceremony layouts of the specification.
-    Ceremony(CeremonySession<'a>),
-    /// The caller selects the ranges itself: the request line and `Host`
-    /// revealed and committed, the whole response committed, and the caller's
-    /// closure choosing what of the response to reveal.
-    ///
-    /// This does NOT tile, so a ceremony attestation produced this way is
-    /// rejected by the Platform Verifier. Two callers use it, and only one of
-    /// them is waiting to be replaced:
-    ///
-    /// * the pre-ceremony X `/me` flow in [`prover`], which goes at cutover;
-    /// * the notary's JWKS session, which is not a ceremony at all -- it reads
-    ///   a public document, carries no credential, and reaches no Platform
-    ///   Verifier. Nothing will replace it, so this variant outlives the
-    ///   legacy flow that first needed it.
-    CallerSelected,
-}
-
-/// The reveal and commit ranges for one ceremony session, both directions.
-/// The `compute_reveal_ranges` closure receives the full `recv` transcript
-/// data after the HTTP exchange completes and must return the byte ranges
-/// within `recv` to selectively disclose. Each range becomes a separate
-/// Merkle leaf in the notary's transcript tree. To reveal the entire
-/// received transcript (as a JWKS-style notary requires), return
-/// `vec![0..recv.len()]`.
+/// A caller producing a ceremony attestation calls
+/// `libid_transcript::ceremony` here and returns what it gives back: those
+/// layouts derive each direction's commitments as the complement of its
+/// reveals, so the direction tiles by construction, which is what the Platform
+/// Verifier's coverage check demands. A caller doing something else -- the
+/// JWKS session reads a public document and reveals all of it -- states its
+/// own.
 ///
-/// Use [`libid_transcript::compute_field_reveal_range`] and friends inside
-/// the closure to locate JSON field values in the response body.
+/// Each revealed range becomes a separate Merkle leaf in the notary's
+/// transcript tree. [`libid_transcript::compute_field_reveal_range`] and
+/// friends locate JSON field values in a response body.
 #[instrument(skip_all, fields(api_host = request.api_host))]
-pub async fn prover_generic<T, F, R>(
+pub async fn prover_generic<T, F, S>(
     socket: T,
     request: &HttpRequestSpec<'_>,
-    reveal_mode: RevealMode<'_>,
-    compute_reveal_ranges: R,
+    select_layout: S,
     on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
     F: Fn(ProverStep),
-    R: FnOnce(&[u8]) -> Result<Vec<Range<usize>>>,
+    S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
 {
     let api_host = request.api_host;
 
@@ -548,18 +490,13 @@ where
         // The ceremony layouts derive their commitments as the complement of
         // the reveals, so each direction tiles by construction -- which is what
         // the Platform Verifier's coverage check demands.
-        let (sent_layout, recv_layout) = match reveal_mode {
-            RevealMode::Ceremony(session) => {
-                let (s, r) = ceremony_layouts(sent, recv, session)?;
-                (Some(s), Some(r))
-            }
-            RevealMode::CallerSelected => (None, None),
-        };
+        // The prover chooses what it reveals -- that is what a prover IS. One
+        // parameter says so, and there is no second mechanism to disagree with
+        // it. A caller wanting the specification's layouts calls
+        // `libid_transcript::ceremony` here and returns what it gives back.
+        let (sent_layout, recv_layout) = select_layout(sent, recv)?;
 
-        let reveal_recv_ranges = match &recv_layout {
-            Some(l) => l.reveal.clone(),
-            None => compute_reveal_ranges(recv)?,
-        };
+        let reveal_recv_ranges = recv_layout.reveal.clone();
 
         // Save the revealed recv segments BEFORE the transcript is moved.
         // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
@@ -569,19 +506,11 @@ where
             .map(|r| recv[r.clone()].to_vec())
             .collect();
 
-        let notary_sent_ranges = match &sent_layout {
-            Some(l) => l.reveal.clone(),
-            None => find_notary_reveal_ranges(sent),
-        };
+        let notary_sent_ranges = sent_layout.reveal.clone();
 
         let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-        let (sent_commits, recv_commits) = match (&sent_layout, &recv_layout) {
-            (Some(s), Some(r)) => (s.commit.clone(), r.commit.clone()),
-            _ => (
-                find_presentation_commit_ranges(sent),
-                core::iter::once(0..recv.len()).collect(),
-            ),
-        };
+        let (sent_commits, recv_commits) =
+            (sent_layout.commit.clone(), recv_layout.commit.clone());
         for range in sent_commits {
             tc_builder
                 .commit_sent(&range)
