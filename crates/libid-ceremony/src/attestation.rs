@@ -68,9 +68,12 @@ pub struct DirectionBlock {
 /// made before it existed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttestedData {
-    pub format_tag: [u8; 32],
-    pub platform_id: [u8; 32],
-    pub operation_tag: [u8; 32],
+    /// The TLS server name the notary authenticated, hashed.
+    ///
+    /// This is the only identity in the record, and the notary observed it
+    /// rather than being told it. Which platform that host belongs to, and
+    /// which session of a ceremony this is, are read from the revealed request
+    /// line by the party that pins those constants.
     pub authority_id: [u8; 32],
     pub created_at: u64,
     pub sent_transcript_length: u32,
@@ -79,9 +82,9 @@ pub struct AttestedData {
     pub received: DirectionBlock,
 }
 
-/// Bytes before the first direction block: four 32-byte tags, `createdAt`, and
-/// the two transcript lengths.
-pub const HEADER_LEN: usize = 32 * 4 + 8 + 4 + 4;
+/// Bytes before the first direction block: the authority, `createdAt`, and the
+/// two transcript lengths.
+pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AttestationError {
@@ -187,9 +190,6 @@ impl AttestedData {
     /// the notary really did observe.
     pub fn encode(&self) -> Result<Vec<u8>, AttestationError> {
         let mut out = Vec::with_capacity(HEADER_LEN);
-        out.extend_from_slice(&self.format_tag);
-        out.extend_from_slice(&self.platform_id);
-        out.extend_from_slice(&self.operation_tag);
         out.extend_from_slice(&self.authority_id);
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.sent_transcript_length.to_be_bytes());
@@ -214,9 +214,6 @@ mod tests {
         // Shaped like the X identity session: the request reveals everything
         // but the bearer, which is committed and framed by the header bytes.
         AttestedData {
-            format_tag: tag("libid.attestation.v1"),
-            platform_id: tag("x"),
-            operation_tag: tag("libid.ceremony.session.identity.v1"),
             authority_id: tag("api.x.com"),
             created_at: 1_770_000_000,
             sent_transcript_length: 60,
@@ -259,15 +256,12 @@ mod tests {
     /// decodes. Both sides carry this fixture, so a change to either encoder
     /// breaks loudly here rather than diverging quietly and rejecting every
     /// genuine attestation on chain.
-    const CROSS_LANGUAGE_FIXTURE: &str = "f1b67c286f7f90224eb4661a5922406b5092042b9515e4e9e448ec1d4f55b352\
-7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83\
-e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
-4930142f5283d4a8eab0d24c588f00b21213ae2a47e7ed6c1dc6a57044f1655d\
+    const CROSS_LANGUAGE_FIXTURE: &str = "4930142f5283d4a8eab0d24c588f00b21213ae2a47e7ed6c1dc6a57044f1655d\
 0000000069800e800000003c00000028000200000000000000146161616161616161616161616161616161616161\
 000000280000003c62626262626262626262626262626262626262620001000000140000002807070707070707070707070707070707070707070707070707070707070707070001000000000000000a6363636363636363636300010000000a000000280909090909090909090909090909090909090909090909090909090909090909";
 
     const CROSS_LANGUAGE_DIGEST: &str =
-        "511d91f8a3c13c1824fd1d3e7c011caf09f2f0763f1ede5c786839592ae8d252";
+        "84f7c0aaf996ddc4db3f5a81baa230849bbf0c554a14302cc0946dcde937104b";
 
     #[test]
     fn agrees_with_the_solidity_decoder() {
@@ -288,17 +282,14 @@ e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
         data.recv_transcript_length = 0;
         // Header plus two empty counts per direction.
         assert_eq!(data.encode().unwrap().len(), HEADER_LEN + 4 + 4);
-        assert_eq!(HEADER_LEN, 144);
+        assert_eq!(HEADER_LEN, 48);
     }
 
     #[test]
     fn every_header_field_changes_the_digest() {
         let base = sample().digest().unwrap();
         for mutate in [
-            (|d: &mut AttestedData| d.format_tag[0] ^= 1) as fn(&mut AttestedData),
-            |d| d.platform_id[0] ^= 1,
-            |d| d.operation_tag[0] ^= 1,
-            |d| d.authority_id[0] ^= 1,
+            (|d: &mut AttestedData| d.authority_id[0] ^= 1) as fn(&mut AttestedData),
             |d| d.created_at += 1,
         ] {
             let mut data = sample();
@@ -309,10 +300,15 @@ e7b961087ec316778e6885d11145cc06f1d75360430f461d0322fb7f105899dd\
 
     #[test]
     fn two_sessions_of_one_ceremony_are_not_interchangeable() {
-        // REQ-COMMON-55: without operationTag the token and identity
-        // attestations of one ceremony would differ in nothing a verifier reads.
+        // Nothing in the record labels which session it covers, and nothing
+        // needs to: the sessions differ in what the notary OBSERVED. The
+        // request line is a revealed range, and the verifier compares it
+        // against the path its profile pins, so a token attestation offered in
+        // the identity slot fails on bytes the notary actually saw rather than
+        // on a label it was handed.
         let mut token = sample();
-        token.operation_tag = tag("libid.ceremony.session.token.v1");
+        token.sent.revealed[0].bytes = b"POST /2/oauth2/token ".to_vec();
+        token.sent.revealed[0].end = token.sent.revealed[0].start + 21;
         assert_ne!(token.digest().unwrap(), sample().digest().unwrap());
     }
 

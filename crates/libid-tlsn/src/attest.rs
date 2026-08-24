@@ -27,13 +27,7 @@ use tlsn::{
 };
 
 /// What the profile pins, and what only the notary knows.
-pub struct AttestationInput<'a> {
-    /// The libID-namespaced string naming this attestation format and version.
-    pub format_tag: &'a str,
-    /// The identity-platform name.
-    pub platform_name: &'a str,
-    /// The libID-namespaced string naming which session this covers.
-    pub operation_tag: &'a str,
+pub struct AttestationInput {
     /// The notary's OWN clock reading when the session completed.
     ///
     /// REQ-COMMON-57 forbids taking this from the prover, from a response
@@ -76,12 +70,9 @@ pub fn attested_data(
     partial: &PartialTranscript,
     authority: &str,
     commitments: &[TranscriptCommitment],
-    input: AttestationInput<'_>,
+    input: AttestationInput,
 ) -> Result<AttestedData, AttestError> {
     Ok(AttestedData {
-        format_tag: tag(input.format_tag),
-        platform_id: tag(input.platform_name),
-        operation_tag: tag(input.operation_tag),
         // The canonical authority of section 9: the lowercase ASCII TLS server
         // name the notary authenticated, with no trailing dot. It is a signed
         // field rather than a transcript range because the transcript carries
@@ -203,11 +194,8 @@ mod tests {
     const SENT: &[u8] = b"GET /2/users/me HTTP/1.1\r\nauthorization: Bearer TOK\r\n\r\n";
     const RECV: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\"}";
 
-    fn input<'a>() -> AttestationInput<'a> {
+    fn input() -> AttestationInput {
         AttestationInput {
-            format_tag: "libid.attestation.v1",
-            platform_name: "x",
-            operation_tag: "libid.ceremony.session.identity.v1",
             created_at: 1_770_000_000,
         }
     }

@@ -21,18 +21,23 @@
 //! the Canonical Runtime call before it spends a second session on an
 //! attestation.
 //!
+//! The same reasoning removed the last labels. The notary used to stamp a
+//! format tag, a platform id and a session tag; it observed none of them. The
+//! format is fixed by the notary key a profile pins alongside it
+//! (REQ-COMMON-18); the platform is the host it connected to; and which session
+//! this is, is the request line it recorded. All three were a party naming
+//! things it was told rather than things it saw.
+//!
 //! So this crate holds one direction of one thing:
 //!
 //! * [`attestation`] -- the types of ceremony-common section 9.1 and the
 //!   encoder that lays them out. No decoder: whoever decodes also checks, and
 //!   that is the chain and the client.
-//! * [`profile`] -- the tags the notary stamps.
 //! * [`token_exchange`] -- the GitHub Token-Exchange Service's own request and
 //!   response records. Its validation stays, because REQ-PLAT-37 to -40 put
 //!   that service's input validation on that service; no contract sees it.
 
 pub mod attestation;
-pub mod profile;
 pub mod token_exchange;
 
 pub use attestation::{
