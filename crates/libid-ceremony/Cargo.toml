@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The digest, PKCE and launch-profile records: a third reading of the
+# specification's constants, for the conformance suite to check the Solidity and
+# TypeScript ones against. No service enables this -- nothing in Rust builds a
+# digest, derives a verifier, or reads a profile record.
+vectors = []
+
 [dependencies]
 base64.workspace = true
 libid-crypto.workspace = true
