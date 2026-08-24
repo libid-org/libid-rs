@@ -165,6 +165,26 @@ fn direction_block(
 
 #[cfg(test)]
 mod tests {
+    /// The Platform Verifier requires the revealed ranges and the commitments
+    /// to account for the signed length exactly. That is its rule to enforce,
+    /// not ours -- but a layout that cannot satisfy it produces attestations no
+    /// verifier accepts, so it is worth asserting here on the way out.
+    fn assert_tiles(block: &libid_ceremony::DirectionBlock, length: u32) {
+        let mut spans: Vec<(u32, u32)> = block
+            .revealed
+            .iter()
+            .map(|r| (r.start, r.end))
+            .chain(block.commitments.iter().map(|c| (c.start, c.end)))
+            .collect();
+        spans.sort_unstable();
+        let mut at = 0u32;
+        for (start, end) in spans {
+            assert_eq!(start, at, "gap or overlap before {start}");
+            at = end;
+        }
+        assert_eq!(at, length, "the spans do not reach the signed length");
+    }
+
     use super::*;
     use libid_transcript::ceremony::{
         self,
@@ -227,14 +247,24 @@ mod tests {
     }
 
     #[test]
-    fn produces_an_attestation_the_codec_accepts() {
+    fn encodes_to_the_length_its_own_fields_imply() {
         let (partial, commitments) = session();
         let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
-        let encoded = data.encode().expect("the notary must emit a valid shape");
-        assert_eq!(
-            libid_ceremony::AttestedData::decode(&encoded).unwrap(),
-            data
-        );
+        let encoded = data.encode().unwrap();
+
+        // No decoder here to round-trip against: decoding is the chain's and
+        // the client's. What stays checkable on this side is that every byte
+        // the fields describe is present, which is the property the layout
+        // gives the forward-parsing decoder something to walk.
+        let mut want = libid_ceremony::attestation::HEADER_LEN;
+        for d in [&data.sent, &data.received] {
+            want += 2 + 2;
+            for r in &d.revealed {
+                want += 8 + r.bytes.len();
+            }
+            want += d.commitments.len() * (8 + 32);
+        }
+        assert_eq!(encoded.len(), want);
     }
 
     #[test]
@@ -243,9 +273,7 @@ mod tests {
         // check the Platform Verifier runs, or no genuine session ever passes.
         let (partial, commitments) = session();
         let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
-        data.sent
-            .require_exact_coverage("sent", data.sent_transcript_length)
-            .expect("an honest identity request tiles exactly");
+        assert_tiles(&data.sent, data.sent_transcript_length);
     }
 
     #[test]
@@ -395,13 +423,8 @@ mod tests {
         )
         .unwrap();
         let data = round_trip(sent, recv, &s, &r);
-
-        data.sent
-            .require_exact_coverage("sent", data.sent_transcript_length)
-            .expect("the identity request must satisfy REQ-COMMON-35");
-        data.received
-            .require_exact_coverage("received", data.recv_transcript_length)
-            .expect("the identity response must tile too");
+        assert_tiles(&data.sent, data.sent_transcript_length);
+        assert_tiles(&data.received, data.recv_transcript_length);
 
         // And exactly one credential is hidden in the request, which is what
         // ties the framed range to the one the circuit opens.
@@ -416,10 +439,7 @@ mod tests {
         let s = ceremony::token_request(sent, None).unwrap();
         let r = ceremony::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
-
-        data.sent
-            .require_exact_coverage("sent", data.sent_transcript_length)
-            .expect("the token request must tile");
+        assert_tiles(&data.sent, data.sent_transcript_length);
         // X reveals its token request whole, so the verifier can see the head
         // boundary and locate the body by the framing the server parsed.
         assert!(data.sent.commitments.is_empty());
@@ -435,10 +455,7 @@ mod tests {
         let s = ceremony::token_request(sent, Some("client_secret")).unwrap();
         let r = ceremony::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
-
-        data.sent
-            .require_exact_coverage("sent", data.sent_transcript_length)
-            .expect("the exchange must tile");
+        assert_tiles(&data.sent, data.sent_transcript_length);
         assert_eq!(data.sent.revealed.len(), 1);
         assert_eq!(data.sent.commitments.len(), 1);
         // Ordered last, so the commitment reaches the transcript end.

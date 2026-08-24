@@ -1,40 +1,39 @@
-//! Wire constructions of the libID identity ceremony.
+//! What the notary needs to sign a ceremony attestation, and nothing else.
 //!
-//! # What Rust actually needs, and what is here for the vectors
+//! # Why this crate is small
 //!
-//! The notary is the only service that touches these bytes in production, and
-//! it needs two things: [`attestation`], to build and sign the attested data of
-//! ceremony-common section 9.1, and the three tags of [`profile`] to stamp into
-//! it. [`token_exchange`] is the GitHub Token-Exchange Service's request and
-//! response records, which that service will encode.
+//! The notary's whole job is to record what it observed and sign it. It does
+//! not judge that record: whether the ranges tile the transcript, whether a
+//! request carries exactly one authorization header, whether the framing bytes
+//! are right -- every one of those is the Platform Verifier's decision, and the
+//! Platform Verifier is Solidity.
 //!
-//! Everything else is behind the `vectors` feature, off by default:
+//! A copy of those checks here would be a second opinion nobody asked for. Its
+//! only power would be to refuse to sign a session the notary really did
+//! observe, which is a denial of service by a party with no standing to judge.
+//! REQ-COMMON-33 says it more plainly: the notary decides nothing
+//! profile-specific.
 //!
-//! * [`authorization`] -- the Authorization Digest of section 5.
-//! * [`pkce`] -- the derived `code_verifier` of section 7.
-//! * [`launch`] -- the launch platform profiles and protocol parameters.
+//! Where a check IS wanted before spending gas, it belongs in the client as a
+//! dry run -- and it already lives there. `@libid/contracts` exports
+//! `decodeAttestedData`, `validate`, `requireExactCoverage` and
+//! `requireBearerHeaderRequest` in TypeScript, which is what REQ-PLAT-44 has
+//! the Canonical Runtime call before it spends a second session on an
+//! attestation.
 //!
-//! Nothing in Rust builds a digest, derives a verifier, or reads a profile
-//! record. The browser builds the first two and the contracts recompute them;
-//! a Platform Verifier pins the third. These modules exist so the conformance
-//! suite can check those two implementations against a third, written
-//! independently from the published vectors -- which makes them a test oracle.
-//! An oracle compiled into every consumer is code nothing calls, and a mistake
-//! in it is invisible. Hence the feature.
+//! So this crate holds one direction of one thing:
 //!
-//! Each module's tests pin it to the conformance vectors the specification
-//! publishes, taken from the specification rather than from this code.
+//! * [`attestation`] -- the types of ceremony-common section 9.1 and the
+//!   encoder that lays them out. No decoder: whoever decodes also checks, and
+//!   that is the chain and the client.
+//! * [`profile`] -- the tags the notary stamps.
+//! * [`token_exchange`] -- the GitHub Token-Exchange Service's own request and
+//!   response records. Its validation stays, because REQ-PLAT-37 to -40 put
+//!   that service's input validation on that service; no contract sees it.
 
 pub mod attestation;
 pub mod profile;
 pub mod token_exchange;
-
-#[cfg(any(test, feature = "vectors"))]
-pub mod authorization;
-#[cfg(any(test, feature = "vectors"))]
-pub mod launch;
-#[cfg(any(test, feature = "vectors"))]
-pub mod pkce;
 
 pub use attestation::{
     AttestationError,
@@ -42,14 +41,4 @@ pub use attestation::{
     DirectionBlock,
     RangeCommitment,
     RevealedRange,
-};
-#[cfg(any(test, feature = "vectors"))]
-pub use authorization::{
-    AuthorizationError,
-    AuthorizationPreimage,
-};
-#[cfg(any(test, feature = "vectors"))]
-pub use pkce::{
-    code_challenge,
-    code_verifier,
 };

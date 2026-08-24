@@ -1,23 +1,14 @@
 [package]
 name = "libid-ceremony"
-description = "Wire constructions of the libID identity ceremony: authorization digest, PKCE binding, and attestation format."
+description = "The attestation record a libID notary signs: the section 9.1 types and their encoder."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-# The digest, PKCE and launch-profile records: a third reading of the
-# specification's constants, for the conformance suite to check the Solidity and
-# TypeScript ones against. No service enables this -- nothing in Rust builds a
-# digest, derives a verifier, or reads a profile record.
-vectors = []
-
 [dependencies]
-base64.workspace = true
 libid-crypto.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
