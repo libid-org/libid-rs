@@ -86,76 +86,17 @@ pub struct AttestedData {
 /// two transcript lengths.
 pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
+/// The one way encoding can fail: a direction holding more entries than the
+/// two-byte count can name.
+///
+/// There is nothing else to get wrong here. Whether the ranges tile, whether
+/// they are ordered, whether a commitment overlaps a revealed range -- this
+/// crate used to answer all of that and no longer does. Those are the Platform
+/// Verifier's decisions, and the client's to preview in a dry run. What is left
+/// is the encoder declining to write down something it cannot represent.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum AttestationError {
-    #[error("attested data ends inside the {field} field")]
-    Truncated { field: &'static str },
-    #[error("{0} bytes remain after the received direction block")]
-    TrailingBytes(usize),
-    #[error("a direction holds {0} entries, which does not fit the two-byte count")]
-    CountTooLarge(usize),
-    #[error("revealed range {index} of the {direction} direction carries {carried} bytes for offsets {start}..{end}")]
-    RangeLengthMismatch {
-        direction: &'static str,
-        index: usize,
-        start: u32,
-        end: u32,
-        carried: usize,
-    },
-    #[error("{kind} {index} of the {direction} direction is empty at offset {start}")]
-    EmptyRange {
-        direction: &'static str,
-        kind: &'static str,
-        index: usize,
-        start: u32,
-    },
-    #[error("{kind} {index} of the {direction} direction starts at {start}, behind the previous end {previous_end}")]
-    OutOfOrder {
-        direction: &'static str,
-        kind: &'static str,
-        index: usize,
-        start: u32,
-        previous_end: u32,
-    },
-    #[error("{kind} {index} of the {direction} direction ends at {end}, past the signed transcript length {length}")]
-    PastTranscriptEnd {
-        direction: &'static str,
-        kind: &'static str,
-        index: usize,
-        end: u32,
-        length: u32,
-    },
-    #[error("a commitment of the {direction} direction overlaps a revealed range at {start}..{end}")]
-    CommitmentOverlapsRevealed {
-        direction: &'static str,
-        start: u32,
-        end: u32,
-    },
-    #[error("transcript bytes {from}..{to} of the {direction} direction are covered by nothing")]
-    CoverageGap {
-        direction: &'static str,
-        from: u32,
-        to: u32,
-    },
-    #[error("spans of the {direction} direction overlap at {at}")]
-    SpansOverlap { direction: &'static str, at: u32 },
-    #[error("the {direction} direction holds {count} commitments, but this request commits exactly one credential")]
-    NotOneCommitment {
-        direction: &'static str,
-        count: usize,
-    },
-    #[error("the revealed {direction} bytes carry an obsolete line fold at {at}")]
-    ObsoleteLineFold { direction: &'static str, at: usize },
-    #[error(
-        "the revealed {direction} bytes hold {count} authorization header lines, not one"
-    )]
-    NotOneAuthorizationHeader {
-        direction: &'static str,
-        count: usize,
-    },
-    #[error("the committed range of the {direction} direction is not framed by an authorization header line")]
-    BadBearerFraming { direction: &'static str },
-}
+#[error("a direction holds {0} entries, which does not fit the two-byte count")]
+pub struct CountTooLarge(pub usize);
 
 /// Derive a 32-byte tag from a libID-namespaced ASCII string.
 ///
@@ -167,20 +108,31 @@ pub fn tag(namespaced: &str) -> [u8; 32] {
 }
 
 impl DirectionBlock {
-    fn encode_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.revealed.len() as u16).to_be_bytes());
+    fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CountTooLarge> {
+        // Not a rule about what a good attestation looks like -- that belongs
+        // to the verifier. This is the encoder saying it cannot write down what
+        // it was handed: a count past `u16` would truncate and produce a record
+        // describing a different session from the one observed.
+        out.extend_from_slice(&count(self.revealed.len())?);
         for range in &self.revealed {
             out.extend_from_slice(&range.start.to_be_bytes());
             out.extend_from_slice(&range.end.to_be_bytes());
             out.extend_from_slice(&range.bytes);
         }
-        out.extend_from_slice(&(self.commitments.len() as u16).to_be_bytes());
+        out.extend_from_slice(&count(self.commitments.len())?);
         for commitment in &self.commitments {
             out.extend_from_slice(&commitment.start.to_be_bytes());
             out.extend_from_slice(&commitment.end.to_be_bytes());
             out.extend_from_slice(&commitment.commitment);
         }
+        Ok(())
     }
+}
+
+fn count(entries: usize) -> Result<[u8; 2], CountTooLarge> {
+    u16::try_from(entries)
+        .map(u16::to_be_bytes)
+        .map_err(|_| CountTooLarge(entries))
 }
 
 impl AttestedData {
@@ -188,20 +140,20 @@ impl AttestedData {
     /// prover's problem, the Platform Verifier's decision, and the client's to
     /// catch in a dry run. Refusing to sign here would only withhold a session
     /// the notary really did observe.
-    pub fn encode(&self) -> Result<Vec<u8>, AttestationError> {
+    pub fn encode(&self) -> Result<Vec<u8>, CountTooLarge> {
         let mut out = Vec::with_capacity(HEADER_LEN);
         out.extend_from_slice(&self.authority_id);
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.sent_transcript_length.to_be_bytes());
         out.extend_from_slice(&self.recv_transcript_length.to_be_bytes());
-        self.sent.encode_into(&mut out);
-        self.received.encode_into(&mut out);
+        self.sent.encode_into(&mut out)?;
+        self.received.encode_into(&mut out)?;
         Ok(out)
     }
 
-    /// Parse and validate. Trailing bytes are refused: the layout accounts for
-    /// every byte, so a suffix is a second message hiding behind the first.
-    pub fn digest(&self) -> Result<[u8; 32], AttestationError> {
+    /// What the notary signs, and the only preimage it ever signs
+    /// (REQ-COMMON-47).
+    pub fn digest(&self) -> Result<[u8; 32], CountTooLarge> {
         Ok(keccak256(&self.encode()?))
     }
 }
@@ -310,6 +262,22 @@ mod tests {
         token.sent.revealed[0].bytes = b"POST /2/oauth2/token ".to_vec();
         token.sent.revealed[0].end = token.sent.revealed[0].start + 21;
         assert_ne!(token.digest().unwrap(), sample().digest().unwrap());
+    }
+
+    #[test]
+    fn refuses_a_count_it_cannot_write_down() {
+        // The two-byte count is the format's, not a judgement about the
+        // session. An encoder that truncated here would sign a record
+        // describing a different session from the one observed.
+        let mut data = sample();
+        data.sent.revealed = (0..70_000u32)
+            .map(|i| RevealedRange {
+                start: i,
+                end: i + 1,
+                bytes: vec![0],
+            })
+            .collect();
+        assert_eq!(data.encode().unwrap_err(), CountTooLarge(70_000));
     }
 
     #[test]

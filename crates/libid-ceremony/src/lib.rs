@@ -41,8 +41,8 @@ pub mod attestation;
 pub mod token_exchange;
 
 pub use attestation::{
-    AttestationError,
     AttestedData,
+    CountTooLarge,
     DirectionBlock,
     RangeCommitment,
     RevealedRange,
