@@ -88,11 +88,11 @@ pub struct AttestedData {
 /// two transcript lengths.
 pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
-/// Derive a 32-byte tag from a libID-namespaced ASCII string.
+/// Hash the canonical authority bytes into `authorityId` (REQ-COMMON-56).
 ///
-/// Used for `formatTag` (REQ-COMMON-53), `platformId` and `operationTag`
-/// (REQ-COMMON-55), and `authorityId` over the canonical authority bytes
-/// (REQ-COMMON-56).
+/// The record's one remaining 32-byte tag. It used to serve three more --
+/// format, platform and session -- and those went with the fields the notary
+/// was handed rather than saw.
 pub fn tag(namespaced: &str) -> [u8; 32] {
     keccak256(namespaced.as_bytes())
 }

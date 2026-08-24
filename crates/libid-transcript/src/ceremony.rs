@@ -10,6 +10,12 @@
 //! Every layout below therefore names only what it REVEALS, and the commitments
 //! are derived as the complement. Tiling then holds by construction rather than
 //! by inspection.
+//!
+//! Nothing here is applied on anyone's behalf. A prover notarizing a ceremony
+//! session calls these and hands the result to `prover_generic`; a prover doing
+//! something else states its own. In Rust that prover will be the GitHub
+//! Token-Exchange Service, for the token session. The other three sessions are
+//! the browser's.
 
 use std::ops::Range;
 
