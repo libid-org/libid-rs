@@ -97,15 +97,18 @@ fn direction_block(
         Direction::Received => (partial.received_authed(), partial.received_unsafe()),
     };
 
-    // One entry per revealed range, in ascending start order, each carrying its
-    // offsets and exactly `end - start` bytes. Revealed bytes signed without
-    // their offsets say that some bytes were disclosed but not where they sat,
-    // which is not enough to tile a transcript (REQ-COMMON-59).
+    // One entry per revealed range, in ascending start order, each carrying
+    // where it sat and what it held. Revealed bytes signed without their
+    // offsets say that some bytes were disclosed but not where they sat, which
+    // is not enough to tile a transcript (REQ-COMMON-59). The end is the
+    // bytes' own length, so it is not written down twice.
     let mut revealed = Vec::new();
     for range in authed.iter() {
+        // Still checked, even though only `start` is encoded: a range whose end
+        // does not fit is a transcript this record cannot describe.
+        u32_of(range.end)?;
         revealed.push(RevealedRange {
             start: u32_of(range.start)?,
-            end: u32_of(range.end)?,
             bytes: data[range.clone()].to_vec(),
         });
     }
@@ -164,7 +167,7 @@ mod tests {
         let mut spans: Vec<(u32, u32)> = block
             .revealed
             .iter()
-            .map(|r| (r.start, r.end))
+            .map(|r| (r.start, r.start + r.bytes.len() as u32))
             .chain(block.commitments.iter().map(|c| (c.start, c.end)))
             .collect();
         spans.sort_unstable();
@@ -246,11 +249,11 @@ mod tests {
         // gives the forward-parsing decoder something to walk.
         let mut want = libid_ceremony::attestation::HEADER_LEN;
         for d in [&data.sent, &data.received] {
-            want += 2 + 2;
+            want += 8 + 8; // one eight-byte count per list
             for r in &d.revealed {
-                want += 8 + r.bytes.len();
+                want += 4 + 8 + r.bytes.len(); // start, byte length, bytes
             }
-            want += d.commitments.len() * (8 + 32);
+            want += d.commitments.len() * (4 + 4 + 32); // start, end, commitment
         }
         assert_eq!(encoded.len(), want);
     }

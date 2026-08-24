@@ -35,17 +35,19 @@ use libid_crypto::keccak256;
 
 /// Offsets are zero-based into that direction's complete transcript, `start`
 /// inclusive and `end` exclusive.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, bincode::Encode)]
 pub struct RevealedRange {
     pub start: u32,
-    pub end: u32,
+    /// The range's plaintext. Its length IS the range's length -- there is no
+    /// `end`, because two ways to say the same thing is one way to disagree.
+    /// The decoder computes `end = start + bytes.len()`.
     pub bytes: Vec<u8>,
 }
 
 /// A hidden range, carried as its offsets and a blinded commitment. The
 /// plaintext of a committed range never appears in the attested data
 /// (REQ-COMMON-60).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, bincode::Encode)]
 pub struct RangeCommitment {
     pub start: u32,
     pub end: u32,
@@ -53,7 +55,7 @@ pub struct RangeCommitment {
 }
 
 /// One direction of the session.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, bincode::Encode)]
 pub struct DirectionBlock {
     pub revealed: Vec<RevealedRange>,
     pub commitments: Vec<RangeCommitment>,
@@ -66,7 +68,7 @@ pub struct DirectionBlock {
 /// Authorization Digest already commits the chain, and binding an attestation
 /// to one verifier would stop a newly registered version checking attestations
 /// made before it existed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, bincode::Encode)]
 pub struct AttestedData {
     /// The TLS server name the notary authenticated, hashed.
     ///
@@ -86,18 +88,6 @@ pub struct AttestedData {
 /// two transcript lengths.
 pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
-/// The one way encoding can fail: a direction holding more entries than the
-/// two-byte count can name.
-///
-/// There is nothing else to get wrong here. Whether the ranges tile, whether
-/// they are ordered, whether a commitment overlaps a revealed range -- this
-/// crate used to answer all of that and no longer does. Those are the Platform
-/// Verifier's decisions, and the client's to preview in a dry run. What is left
-/// is the encoder declining to write down something it cannot represent.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("a direction holds {0} entries, which does not fit the two-byte count")]
-pub struct CountTooLarge(pub usize);
-
 /// Derive a 32-byte tag from a libID-namespaced ASCII string.
 ///
 /// Used for `formatTag` (REQ-COMMON-53), `platformId` and `operationTag`
@@ -107,53 +97,35 @@ pub fn tag(namespaced: &str) -> [u8; 32] {
     keccak256(namespaced.as_bytes())
 }
 
-impl DirectionBlock {
-    fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CountTooLarge> {
-        // Not a rule about what a good attestation looks like -- that belongs
-        // to the verifier. This is the encoder saying it cannot write down what
-        // it was handed: a count past `u16` would truncate and produce a record
-        // describing a different session from the one observed.
-        out.extend_from_slice(&count(self.revealed.len())?);
-        for range in &self.revealed {
-            out.extend_from_slice(&range.start.to_be_bytes());
-            out.extend_from_slice(&range.end.to_be_bytes());
-            out.extend_from_slice(&range.bytes);
-        }
-        out.extend_from_slice(&count(self.commitments.len())?);
-        for commitment in &self.commitments {
-            out.extend_from_slice(&commitment.start.to_be_bytes());
-            out.extend_from_slice(&commitment.end.to_be_bytes());
-            out.extend_from_slice(&commitment.commitment);
-        }
-        Ok(())
-    }
-}
-
-fn count(entries: usize) -> Result<[u8; 2], CountTooLarge> {
-    u16::try_from(entries)
-        .map(u16::to_be_bytes)
-        .map_err(|_| CountTooLarge(entries))
-}
+/// Big-endian, fixed-width, no varints: the decoder is Solidity, which has no
+/// use for a compact integer that costs a branch to read.
+///
+/// Pinned to one exact bincode version in `Cargo.toml`. These bytes are a
+/// signed preimage, so a layout change in a patch release would silently
+/// change what every notary signs -- and the cross-language fixture below is
+/// what would catch it.
+const WIRE: bincode::config::Configuration<
+    bincode::config::BigEndian,
+    bincode::config::Fixint,
+> = bincode::config::standard()
+    .with_big_endian()
+    .with_fixed_int_encoding();
 
 impl AttestedData {
     /// Lay the record out. This does NOT judge it: a malformed record is the
     /// prover's problem, the Platform Verifier's decision, and the client's to
     /// catch in a dry run. Refusing to sign here would only withhold a session
     /// the notary really did observe.
-    pub fn encode(&self) -> Result<Vec<u8>, CountTooLarge> {
-        let mut out = Vec::with_capacity(HEADER_LEN);
-        out.extend_from_slice(&self.authority_id);
-        out.extend_from_slice(&self.created_at.to_be_bytes());
-        out.extend_from_slice(&self.sent_transcript_length.to_be_bytes());
-        out.extend_from_slice(&self.recv_transcript_length.to_be_bytes());
-        self.sent.encode_into(&mut out)?;
-        self.received.encode_into(&mut out)?;
-        Ok(out)
+    ///
+    /// The layout is the struct above, in declaration order. Nothing here
+    /// restates it, so nothing here can drift from it.
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
+        bincode::encode_to_vec(self, WIRE)
     }
 
     /// What the notary signs, and the only preimage it ever signs
     /// (REQ-COMMON-47).
-    pub fn digest(&self) -> Result<[u8; 32], CountTooLarge> {
+    pub fn digest(&self) -> Result<[u8; 32], bincode::error::EncodeError> {
         Ok(keccak256(&self.encode()?))
     }
 }
@@ -174,12 +146,10 @@ mod tests {
                 revealed: vec![
                     RevealedRange {
                         start: 0,
-                        end: 20,
                         bytes: vec![b'a'; 20],
                     },
                     RevealedRange {
                         start: 40,
-                        end: 60,
                         bytes: vec![b'b'; 20],
                     },
                 ],
@@ -192,7 +162,6 @@ mod tests {
             received: DirectionBlock {
                 revealed: vec![RevealedRange {
                     start: 0,
-                    end: 10,
                     bytes: vec![b'c'; 10],
                 }],
                 commitments: vec![RangeCommitment {
@@ -208,12 +177,10 @@ mod tests {
     /// decodes. Both sides carry this fixture, so a change to either encoder
     /// breaks loudly here rather than diverging quietly and rejecting every
     /// genuine attestation on chain.
-    const CROSS_LANGUAGE_FIXTURE: &str = "4930142f5283d4a8eab0d24c588f00b21213ae2a47e7ed6c1dc6a57044f1655d\
-0000000069800e800000003c00000028000200000000000000146161616161616161616161616161616161616161\
-000000280000003c62626262626262626262626262626262626262620001000000140000002807070707070707070707070707070707070707070707070707070707070707070001000000000000000a6363636363636363636300010000000a000000280909090909090909090909090909090909090909090909090909090909090909";
+    const CROSS_LANGUAGE_FIXTURE: &str = "4930142f5283d4a8eab0d24c588f00b21213ae2a47e7ed6c1dc6a57044f1655d0000000069800e800000003c00000028000000000000000200000000000000000000001461616161616161616161616161616161616161610000002800000000000000146262626262626262626262626262626262626262000000000000000100000014000000280707070707070707070707070707070707070707070707070707070707070707000000000000000100000000000000000000000a6363636363636363636300000000000000010000000a000000280909090909090909090909090909090909090909090909090909090909090909";
 
     const CROSS_LANGUAGE_DIGEST: &str =
-        "84f7c0aaf996ddc4db3f5a81baa230849bbf0c554a14302cc0946dcde937104b";
+        "48162f05bdb27b19b3544bf2aae608745861bf357bb31e07f536b6fb50e95936";
 
     #[test]
     fn agrees_with_the_solidity_decoder() {
@@ -233,7 +200,8 @@ mod tests {
         data.sent_transcript_length = 0;
         data.recv_transcript_length = 0;
         // Header plus two empty counts per direction.
-        assert_eq!(data.encode().unwrap().len(), HEADER_LEN + 4 + 4);
+        // Four counts, one per direction per list, eight bytes each.
+        assert_eq!(data.encode().unwrap().len(), HEADER_LEN + 4 * 8);
         assert_eq!(HEADER_LEN, 48);
     }
 
@@ -260,32 +228,15 @@ mod tests {
         // on a label it was handed.
         let mut token = sample();
         token.sent.revealed[0].bytes = b"POST /2/oauth2/token ".to_vec();
-        token.sent.revealed[0].end = token.sent.revealed[0].start + 21;
         assert_ne!(token.digest().unwrap(), sample().digest().unwrap());
-    }
-
-    #[test]
-    fn refuses_a_count_it_cannot_write_down() {
-        // The two-byte count is the format's, not a judgement about the
-        // session. An encoder that truncated here would sign a record
-        // describing a different session from the one observed.
-        let mut data = sample();
-        data.sent.revealed = (0..70_000u32)
-            .map(|i| RevealedRange {
-                start: i,
-                end: i + 1,
-                bytes: vec![0],
-            })
-            .collect();
-        assert_eq!(data.encode().unwrap_err(), CountTooLarge(70_000));
     }
 
     #[test]
     fn a_shifted_boundary_cannot_produce_one_preimage() {
         // Moving a byte from a revealed range into the next one changes the
-        // encoding, because both offsets and both lengths are written down.
+        // encoding: the range's length is its bytes, and the following span
+        // starts one earlier.
         let mut moved = sample();
-        moved.sent.revealed[0].end = 19;
         moved.sent.revealed[0].bytes.pop();
         moved.sent.commitments[0].start = 19;
         assert_ne!(moved.digest().unwrap(), sample().digest().unwrap());

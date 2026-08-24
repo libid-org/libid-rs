@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bincode.workspace = true
 libid-crypto.workspace = true
 thiserror.workspace = true
 
