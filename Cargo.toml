@@ -40,6 +40,9 @@ base64 = "0.22"
 # in a patch release would change what every notary signs.
 bincode = { version = "=2.0.1", features = ["derive"] }
 hex = "0.4"
+# Chunk-size parsing. Hand-rolling it is how a malformed chunk becomes a short
+# body instead of an error.
+httparse = "1"
 http-body-util = "0.1"
 hyper = { version = "1.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["full"] }
