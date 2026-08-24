@@ -284,8 +284,9 @@ where
             user_agent: params.user_agent,
         },
         // This flow predates the ceremony layouts and still selects the old
-        // sparse ranges. `RevealMode::Ceremony` is what a ceremony session uses.
-        RevealMode::Legacy,
+        // sparse ranges, which is why it cannot produce a ceremony attestation.
+        // It goes at cutover; `RevealMode::Ceremony` is what replaces it.
+        RevealMode::CallerSelected,
         |recv| {
             let mut ranges =
                 vec![
@@ -366,14 +367,20 @@ pub enum CeremonySession<'a> {
 pub enum RevealMode<'a> {
     /// The ceremony layouts of the specification.
     Ceremony(CeremonySession<'a>),
-    /// The pre-ceremony selection: the request line and `Host` revealed and
-    /// committed, the whole response committed, and the caller's closure
-    /// choosing what of the response to reveal.
+    /// The caller selects the ranges itself: the request line and `Host`
+    /// revealed and committed, the whole response committed, and the caller's
+    /// closure choosing what of the response to reveal.
     ///
-    /// Kept only until the ceremony path replaces every caller. It does NOT
-    /// tile, so an attestation produced this way is rejected by the Platform
-    /// Verifier.
-    Legacy,
+    /// This does NOT tile, so a ceremony attestation produced this way is
+    /// rejected by the Platform Verifier. Two callers use it, and only one of
+    /// them is waiting to be replaced:
+    ///
+    /// * the pre-ceremony X `/me` flow in [`prover`], which goes at cutover;
+    /// * the notary's JWKS session, which is not a ceremony at all -- it reads
+    ///   a public document, carries no credential, and reaches no Platform
+    ///   Verifier. Nothing will replace it, so this variant outlives the
+    ///   legacy flow that first needed it.
+    CallerSelected,
 }
 
 /// The reveal and commit ranges for one ceremony session, both directions.
@@ -546,7 +553,7 @@ where
                 let (s, r) = ceremony_layouts(sent, recv, session)?;
                 (Some(s), Some(r))
             }
-            RevealMode::Legacy => (None, None),
+            RevealMode::CallerSelected => (None, None),
         };
 
         let reveal_recv_ranges = match &recv_layout {
