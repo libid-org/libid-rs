@@ -11,7 +11,7 @@
 //!   offsets that become Merkle leaves.
 //! * [`wire`] — the length-prefixed JSON protocol the notary and prover speak
 //!   over the recovered socket after MPC-TLS closes.
-//! * [`types`] — [`EvmProof`], [`NotaryResponse`] and [`TlsHandshakeData`],
+//! * [`types`] — [`TlsHandshakeData`],
 //!   the notary's output as consumed by backends and on-chain verifiers.
 
 pub mod ceremony;
@@ -35,11 +35,7 @@ pub use ranges::{
     find_request_line_range,
     find_response_body_range,
 };
-pub use types::{
-    EvmProof,
-    NotaryResponse,
-    TlsHandshakeData,
-};
+pub use types::TlsHandshakeData;
 pub use wire::{
     read_msg,
     write_msg,

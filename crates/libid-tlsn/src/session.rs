@@ -208,12 +208,6 @@ impl ProverStep {
 pub struct ProverResult<T> {
     /// The HTTP response body from the platform API (decoded, headers stripped).
     pub response_body: Vec<u8>,
-    /// Revealed recv segments — the exact bytes the prover disclosed to the notary.
-    /// The notary hashes each segment as `double_hash_leaf("recv:", segment)` to
-    /// build the `recv:` Merkle leaves of the EvmProof. One entry per revealed range.
-    pub recv_segments: Vec<Vec<u8>>,
-    /// The attestation request to send to the notary.
-    pub request: Request,
     /// The TLS secrets for proof construction.
     pub secrets: Secrets,
     /// Extracted TLS handshake data.
@@ -505,14 +499,6 @@ where
 
         let reveal_recv_ranges = recv_layout.reveal.clone();
 
-        // Save the revealed recv segments BEFORE the transcript is moved.
-        // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
-        // saving them here lets the ZK prover verify the full chain.
-        let recv_segments: Vec<Vec<u8>> = reveal_recv_ranges
-            .iter()
-            .map(|r| recv[r.clone()].to_vec())
-            .collect();
-
         let notary_sent_ranges = sent_layout.reveal.clone();
 
         let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
@@ -608,7 +594,10 @@ where
                 prover_output.transcript_secrets,
                 prover_output.transcript_commitments,
             );
-        let (att_request, secrets) = req_builder
+        // The request itself goes nowhere: the notary answers a session with the
+        // section 9.1 record and reads no attestation request. `build` is still
+        // what produces `secrets`, so it stays.
+        let (_att_request, secrets) = req_builder
             .build(&CryptoProvider::default())
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("attestation request: {e}"),
@@ -620,7 +609,7 @@ where
         })?;
         handle.close();
 
-        Ok((body, recv_segments, att_request, secrets, handshake))
+        Ok((body, secrets, handshake))
     };
     tokio::pin!(setup);
 
@@ -628,7 +617,7 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
-    let (body, recv_segments, att_request, secrets, handshake) = tokio::select! {
+    let (body, secrets, handshake) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
@@ -649,8 +638,6 @@ where
 
     Ok(ProverResult {
         response_body: body.to_vec(),
-        recv_segments,
-        request: att_request,
         secrets,
         handshake,
         recovered_io,
