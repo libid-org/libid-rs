@@ -17,14 +17,13 @@ digests the libID on-chain verifiers check.
 
 ## The tlsn git-dep caveat
 
-`libid-tlsn` depends on `tlsn` pinned to a git revision
-(`tlsnotary/tlsn @ 040c6881`); the TLSNotary project publishes nothing to
-crates.io, and cargo refuses to publish crates with git dependencies. Until
-upstream cuts a matching release, consume it as a git dependency:
+`libid-tlsn` depends on the `tlsn` `v0.1.0-alpha.15` git tag; the TLSNotary
+project publishes no `tlsn` crate to crates.io, and cargo refuses to publish
+crates with git dependencies. Consume it as a git dependency:
 
 ```toml
 [dependencies]
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 ```
 
 The crate split exists precisely so this caveat stays contained: everything
