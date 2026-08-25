@@ -43,6 +43,8 @@ pub enum LayoutError {
     NoHeadBoundary,
     #[error("the credential to commit was not found in the request body")]
     MissingCredential,
+    #[error("the response has no status line, so nothing says the server agreed")]
+    NoStatusLine,
 }
 
 /// The bytes of `[0, len)` that `reveal` does not cover.
@@ -107,6 +109,23 @@ pub fn token_request(
 /// Those two anchors are what identify the committed bearer. Without them the
 /// committed range is indistinguishable from a `refresh_token` value, or any
 /// other substring the prover chose to commit (REQ-PLAT-57, REQ-PLAT-58).
+/// The status line, from the origin to its CRLF.
+///
+/// Revealed in every response layout so the Platform Verifier can see that the
+/// server agreed. Without it, consent is inferred from the wanted fields
+/// happening to be present -- which is an argument about what an error body
+/// does not contain, not a check.
+///
+/// Anchored at offset zero, so the verifier reads it as the status line rather
+/// than as bytes that look like one.
+fn status_line(recv: &[u8]) -> Result<Range<usize>, LayoutError> {
+    let end = recv
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or(LayoutError::NoStatusLine)?;
+    Ok(0..end)
+}
+
 pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
     const ANCHOR: &[u8] = b"\"access_token\":\"";
     let anchor_start = recv
@@ -121,7 +140,11 @@ pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
             .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
 
     Ok(layout(
-        vec![anchor_start..value_start, value_end..value_end + 1],
+        vec![
+            status_line(recv)?,
+            anchor_start..value_start,
+            value_end..value_end + 1,
+        ],
         recv.len(),
     ))
 }
@@ -181,8 +204,9 @@ pub fn identity_response(
     let handle = compute_field_snippet_range(recv, handle_field)
         .ok_or_else(|| LayoutError::MissingField(handle_field.into()))?;
 
-    // JSON member order is not fixed, so sort rather than assume.
-    let mut reveal = vec![id, handle];
+    // JSON member order is not fixed, so sort rather than assume. The status
+    // line is first by construction, but sorting covers it too.
+    let mut reveal = vec![status_line(recv)?, id, handle];
     reveal.sort_by_key(|r| r.start);
     Ok(layout(reveal, recv.len()))
 }
@@ -240,6 +264,37 @@ mod tests {
         );
     }
 
+    /// Consent is a fact about the response, not an inference from what an
+    /// error body happens not to contain. Both layouts reveal it, at offset
+    /// zero, so the verifier reads a status line rather than bytes that look
+    /// like one.
+    #[test]
+    fn every_response_layout_reveals_the_status_line_at_the_origin() {
+        let token: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"X\"}";
+        let identity: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"1\",\"username\":\"a\"}";
+
+        for l in [
+            token_response(token).unwrap(),
+            identity_response(identity, "id", IdShape::JsonString, "username").unwrap(),
+        ] {
+            assert_eq!(l.reveal[0].start, 0);
+            assert_eq!(l.reveal[0].end, 15);
+        }
+    }
+
+    /// A response with no CRLF has no status line to reveal, and a layout that
+    /// silently omitted it would produce an attestation the verifier refuses
+    /// for a reason the prover cannot see.
+    #[test]
+    fn a_response_without_a_status_line_is_refused() {
+        // Carries the field, so it gets past the anchor search and fails on
+        // the thing under test rather than before it.
+        assert_eq!(
+            token_response(b"{\"access_token\":\"X\"}").unwrap_err(),
+            LayoutError::NoStatusLine
+        );
+    }
+
     #[test]
     fn the_token_response_reveals_only_the_two_anchors() {
         let recv: &[u8] =
@@ -248,9 +303,13 @@ mod tests {
         assert!(tiles(&l, recv.len()));
         assert_eq!(
             recv[l.reveal[0].clone()].to_vec(),
+            b"HTTP/1.1 200 OK".to_vec()
+        );
+        assert_eq!(
+            recv[l.reveal[1].clone()].to_vec(),
             b"\"access_token\":\"".to_vec()
         );
-        assert_eq!(recv[l.reveal[1].clone()].to_vec(), b"\"".to_vec());
+        assert_eq!(recv[l.reveal[2].clone()].to_vec(), b"\"".to_vec());
         // The bearer is committed, between the two anchors.
         assert!(l.commit.iter().any(|c| recv[c.clone()] == *b"SECRETBEARER"));
     }
@@ -281,15 +340,19 @@ mod tests {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
         let l = identity_response(recv, "id", IdShape::JsonString, "username").unwrap();
         assert!(tiles(&l, recv.len()));
-        assert_eq!(l.reveal.len(), 2);
+        assert_eq!(l.reveal.len(), 3);
+        assert_eq!(
+            recv[l.reveal[0].clone()].to_vec(),
+            b"HTTP/1.1 200 OK".to_vec()
+        );
         // Whole members, delimiters included -- so the verifier reads the
         // field's value and not a substring of the display name beside it.
         assert_eq!(
-            recv[l.reveal[0].clone()].to_vec(),
+            recv[l.reveal[1].clone()].to_vec(),
             b"\"id\":\"2244994945\"".to_vec()
         );
         assert_eq!(
-            recv[l.reveal[1].clone()].to_vec(),
+            recv[l.reveal[2].clone()].to_vec(),
             b"\"username\":\"alice\"".to_vec()
         );
         // The display name stays committed.
