@@ -161,13 +161,28 @@ pub enum IdShape {
     JsonInteger,
 }
 
-/// The identity response: the two identity members with their full delimiters,
-/// and nothing else.
+/// The identity response: revealed WHOLE, hiding nothing.
 ///
-/// Each member is revealed whole -- delimiter, value and closing byte -- so the
-/// verifier reads that field's value rather than a substring of a neighbouring
-/// one, and so the match sits inside a single revealed run rather than being
-/// spliced out of several.
+/// This one has no choice to make, and the reason is worth stating because the
+/// obvious layout -- reveal the two identity members, commit the rest -- is
+/// unsafe.
+///
+/// Every reader on the verifying side scans revealed bytes: the per-range field
+/// read and the cross-range delimiter count alike. A commitment is invisible to
+/// all of them. So a response that genuinely names an authoritative field twice
+/// -- one member echoed out of a profile string the account controls -- lets a
+/// prover commit the real member and reveal the one it composed. Both checks
+/// then see exactly one, and the handle bound is the prover's rather than the
+/// account's.
+///
+/// Uniqueness over a document cannot be established from part of it. So the
+/// verifier requires zero commitments here (`requireFullyRevealed`), and this
+/// produces zero. Nothing is lost: the response is the account's own public
+/// profile, and the credential that fetched it is in the REQUEST direction.
+///
+/// The arguments are still taken and still checked. A response missing either
+/// member is a failure now rather than at the verifier, where the reason would
+/// be an offset rather than a name.
 pub fn identity_response(
     recv: &[u8],
     id_field: &str,
@@ -176,15 +191,12 @@ pub fn identity_response(
 ) -> Result<Layout, LayoutError> {
     // The bare-integer form takes its structural terminator with it, which is
     // what proves the revealed digits are the whole number.
-    let id = compute_id_snippet_range(recv, id_field, id_shape == IdShape::JsonString)
+    compute_id_snippet_range(recv, id_field, id_shape == IdShape::JsonString)
         .ok_or_else(|| LayoutError::MissingField(id_field.into()))?;
-    let handle = compute_field_snippet_range(recv, handle_field)
+    compute_field_snippet_range(recv, handle_field)
         .ok_or_else(|| LayoutError::MissingField(handle_field.into()))?;
 
-    // JSON member order is not fixed, so sort rather than assume.
-    let mut reveal = vec![id, handle];
-    reveal.sort_by_key(|r| r.start);
-    Ok(layout(reveal, recv.len()))
+    Ok(layout(one(0..recv.len()), recv.len()))
 }
 
 #[cfg(test)]
@@ -277,26 +289,39 @@ mod tests {
     }
 
     #[test]
-    fn the_x_identity_response_reveals_both_members_whole() {
+    fn the_identity_response_hides_nothing() {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
         let l = identity_response(recv, "id", IdShape::JsonString, "username").unwrap();
         assert!(tiles(&l, recv.len()));
-        assert_eq!(l.reveal.len(), 2);
-        // Whole members, delimiters included -- so the verifier reads the
-        // field's value and not a substring of the display name beside it.
-        assert_eq!(
-            recv[l.reveal[0].clone()].to_vec(),
-            b"\"id\":\"2244994945\"".to_vec()
+        assert_eq!(l.reveal, vec![0..recv.len()]);
+        assert!(
+            l.commit.is_empty(),
+            "a commitment here hides a duplicate member from every reader"
         );
+    }
+
+    /// The attack the whole-reveal exists for, stated as the layout refusing to
+    /// produce the shape that admits it.
+    ///
+    /// `name` is the account's own display string. Set it to close the JSON
+    /// member and open another, and the signed response holds two `username`
+    /// members. Committing the first and revealing the second would pass a
+    /// per-range read and a cross-range count both.
+    #[test]
+    fn a_response_naming_a_member_twice_still_hides_nothing() {
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"name\":\"\",\"username\":\"victim\",\"username\":\"alice\"}";
+        let l = identity_response(recv, "id", IdShape::JsonString, "username").unwrap();
+        assert!(l.commit.is_empty());
+        // Both members are in the revealed run, so the verifier's duplicate
+        // check has something to fire on.
+        let revealed = &recv[l.reveal[0].clone()];
         assert_eq!(
-            recv[l.reveal[1].clone()].to_vec(),
-            b"\"username\":\"alice\"".to_vec()
+            revealed
+                .windows(11)
+                .filter(|w| *w == b"\"username\":")
+                .count(),
+            2
         );
-        // The display name stays committed.
-        assert!(l
-            .commit
-            .iter()
-            .any(|c| recv[c.clone()].windows(4).any(|w| w == b"name")));
     }
 
     #[test]
