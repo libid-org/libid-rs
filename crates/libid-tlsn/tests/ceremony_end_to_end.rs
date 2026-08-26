@@ -227,18 +227,24 @@ fn the_identity_session_produces_a_record_the_verifier_accepts() {
     normalized.retain(|&b| b != b' ' && b != b'\t');
     assert_eq!(count(&normalized, b"\r\nauthorization:bearer"), 1);
 
-    // `requireFullyRevealed`: the response hides nothing, so the duplicate
-    // scan below can see the whole document.
+    // `requireExactCoverage`: the response is tiled, and what it does not
+    // reveal it commits -- so the account metadata beside the two members never
+    // reaches the chain.
     assert!(
-        data.received.commitments.is_empty(),
-        "a commitment here would hide a duplicate member from every reader"
+        !data.received.commitments.is_empty(),
+        "the rest of the response must be committed, not published"
     );
 
-    // And what that buys: each identity member appears exactly once in bytes
-    // the verifier can read.
+    // What the verifier can read is exactly the two members, each once. A
+    // duplicate reaching these bytes is still caught on chain; one behind a
+    // commitment is not, and ASM-PROV-06 is what stands in for that.
     let body = joined(&data.received);
     assert_eq!(count(&body, b"\"id\":\""), 1);
     assert_eq!(count(&body, b"\"username\":\""), 1);
+    assert!(
+        !body.windows(2).any(|w| w == b"Al"),
+        "the display name must stay behind a commitment"
+    );
 }
 
 /// The record has to survive the wire, not merely exist: the encoding is what
