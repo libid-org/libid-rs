@@ -1,4 +1,4 @@
-//! The GitHub Token-Exchange Service contract of platform-ceremonies section 6.3.
+//! The GitHub Token Service contract of platform-ceremonies section 6.3.
 //!
 //! GitHub uses a confidential client, so the exchange cannot run in the
 //! browser: the client secret would have to go there. The deployment runs it
@@ -8,15 +8,30 @@
 //! The service is stateless by requirement, not by preference. It holds
 //! ceremony credentials, so retention would create a compromise target with no
 //! protocol purpose (REQ-PLAT-42).
-
-/// Fixed route on the redirect origin.
-pub const ROUTE: &str = "/oauth/github/token-exchange";
+//!
+//! # What this module is, and is not
+//!
+//! Section 6.3 names protocol values, not serialized field names: "the browser
+//! and deployment specifications own endpoint naming, transport framing,
+//! serialization, parsing bounds, caller authentication, and cache policy".
+//! So the route does not live here -- the deployment picks it, and the
+//! implementation that serves it states it.
+//!
+//! What lives here is the record pair and the bounds a served request and
+//! response must satisfy before the service acts on either. The semantics come
+//! from REQ-PLAT-37, -38, -41, -54 and -55; the byte bounds come from the
+//! GitHub token endpoint of the ceremony server contract, which is the
+//! deployment specification that owns them.
 
 pub const MAX_CODE_BYTES: usize = 1024;
 pub const CODE_VERIFIER_LEN: usize = 43;
 pub const MAX_ACCESS_TOKEN_BYTES: usize = 4096;
-pub const MAX_BEARER_OPENING_BYTES: usize = 256;
-pub const MAX_TOKEN_ATTESTATION_BYTES: usize = 2 * 1024 * 1024;
+/// The bearer commitment's blinder is fixed-width prover material, not a
+/// bounded string: the circuit opens exactly this many bytes.
+pub const BEARER_OPENING_LEN: usize = 16;
+pub const MAX_ATTESTED_DATA_BYTES: usize = 2 * 1024 * 1024;
+/// A recoverable secp256k1 signature: `r || s || v`.
+pub const SIGNATURE_LEN: usize = 65;
 pub const MAX_RESPONSE_BYTES: usize = 3 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -29,14 +44,30 @@ pub enum TokenExchangeError {
     CodeNotPrintable(usize),
     #[error("codeVerifier must match [A-Za-z0-9_-]{{43}}")]
     MalformedCodeVerifier,
+    #[error("accessToken is empty")]
+    EmptyAccessToken,
     #[error("accessToken is {0} bytes, over the {MAX_ACCESS_TOKEN_BYTES}-byte bound")]
     AccessTokenTooLong(usize),
+    #[error("accessToken carries a byte outside printable ASCII at index {0}")]
+    AccessTokenNotPrintable(usize),
+    #[error("attestedData is empty")]
+    EmptyAttestedData,
+    #[error("attestedData is {0} bytes, over the {MAX_ATTESTED_DATA_BYTES}-byte bound")]
+    AttestedDataTooLong(usize),
+    #[error("signature is {0} bytes, not the {SIGNATURE_LEN} a notary signature is")]
+    SignatureWrongLength(usize),
     #[error(
-        "bearerOpening is {0} bytes, over the {MAX_BEARER_OPENING_BYTES}-byte bound"
+        "bearerOpening is {0} bytes, not the {BEARER_OPENING_LEN} the circuit opens"
     )]
-    BearerOpeningTooLong(usize),
-    #[error("tokenAttestation is {0} bytes, over the {MAX_TOKEN_ATTESTATION_BYTES}-byte bound")]
-    AttestationTooLong(usize),
+    BearerOpeningWrongLength(usize),
+}
+
+/// The index of the first byte outside printable ASCII, which excludes
+/// whitespace and control characters. Both credentials carried here are held to
+/// it: the code because it is echoed into a platform request, the bearer
+/// because it is echoed into an `Authorization` header.
+fn first_unprintable(s: &str) -> Option<usize> {
+    s.bytes().position(|b| !(0x21..=0x7e).contains(&b))
 }
 
 /// What the Canonical Runtime sends. Nothing else: the service uses only its
@@ -44,9 +75,25 @@ pub enum TokenExchangeError {
 /// configuration, and accepts no caller-selected action, client, redirect,
 /// endpoint or return URL (REQ-PLAT-41).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenExchangeRequestV1 {
+pub struct TokenRequest {
     pub code: String,
     pub code_verifier: String,
+}
+
+/// The signed attestation of the notarized exchange.
+///
+/// The bytes alone are not the attestation. REQ-PLAT-38 has the service return
+/// the attestation, and an attestation is a byte string together with the
+/// notary signature over it -- a record carrying only the bytes leaves the
+/// browser holding something no verifier can check, and no field to put the
+/// signature in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenAttestation {
+    /// The byte-exact attested data of the notarized exchange, preserved as
+    /// the notary produced it.
+    pub attested_data: Vec<u8>,
+    /// The notary signature authenticating those exact bytes.
+    pub signature: Vec<u8>,
 }
 
 /// What comes back. `access_token` and `bearer_opening` both stay inside the
@@ -54,10 +101,9 @@ pub struct TokenExchangeRequestV1 {
 /// and publishing it beside the commitment would publish the credential the
 /// commitment exists to hide (REQ-PLAT-55).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenExchangeResponseV1 {
+pub struct TokenResponse {
     pub access_token: String,
-    /// The attested data of the notarized exchange, as bytes.
-    pub token_attestation: Vec<u8>,
+    pub token_attestation: TokenAttestation,
     /// The blinder that opens the committed bearer range of that attestation.
     ///
     /// Without it the browser holds the attestation and the bearer but cannot
@@ -66,8 +112,9 @@ pub struct TokenExchangeResponseV1 {
     pub bearer_opening: Vec<u8>,
 }
 
-impl TokenExchangeRequestV1 {
-    /// Bounded parsing, per REQ-PLAT-37 and REQ-PLAT-38.
+impl TokenRequest {
+    /// Bounded parsing, per REQ-PLAT-37 and the request bounds of the server
+    /// contract.
     pub fn validate(&self) -> Result<(), TokenExchangeError> {
         if self.code.is_empty() {
             return Err(TokenExchangeError::EmptyCode);
@@ -75,9 +122,7 @@ impl TokenExchangeRequestV1 {
         if self.code.len() > MAX_CODE_BYTES {
             return Err(TokenExchangeError::CodeTooLong(self.code.len()));
         }
-        // Printable ASCII excludes whitespace and control characters, which is
-        // what REQ-PLAT-37 asks for in one test.
-        if let Some(i) = self.code.bytes().position(|b| !(0x21..=0x7e).contains(&b)) {
+        if let Some(i) = first_unprintable(&self.code) {
             return Err(TokenExchangeError::CodeNotPrintable(i));
         }
         if self.code_verifier.len() != CODE_VERIFIER_LEN
@@ -92,22 +137,42 @@ impl TokenExchangeRequestV1 {
     }
 }
 
-impl TokenExchangeResponseV1 {
-    /// Bounded parsing, per REQ-PLAT-39.
+impl TokenResponse {
+    /// Bounded parsing, per REQ-PLAT-38 and the response bounds of the server
+    /// contract.
+    ///
+    /// The three values are one result and the bounds say so: a bearer the
+    /// header cannot carry, an opening the circuit cannot use, or a signature
+    /// no recovery accepts each make the other two worthless, so each is exact
+    /// rather than merely capped.
     pub fn validate(&self) -> Result<(), TokenExchangeError> {
+        if self.access_token.is_empty() {
+            return Err(TokenExchangeError::EmptyAccessToken);
+        }
         if self.access_token.len() > MAX_ACCESS_TOKEN_BYTES {
             return Err(TokenExchangeError::AccessTokenTooLong(
                 self.access_token.len(),
             ));
         }
-        if self.bearer_opening.len() > MAX_BEARER_OPENING_BYTES {
-            return Err(TokenExchangeError::BearerOpeningTooLong(
-                self.bearer_opening.len(),
+        if let Some(i) = first_unprintable(&self.access_token) {
+            return Err(TokenExchangeError::AccessTokenNotPrintable(i));
+        }
+        if self.token_attestation.attested_data.is_empty() {
+            return Err(TokenExchangeError::EmptyAttestedData);
+        }
+        if self.token_attestation.attested_data.len() > MAX_ATTESTED_DATA_BYTES {
+            return Err(TokenExchangeError::AttestedDataTooLong(
+                self.token_attestation.attested_data.len(),
             ));
         }
-        if self.token_attestation.len() > MAX_TOKEN_ATTESTATION_BYTES {
-            return Err(TokenExchangeError::AttestationTooLong(
-                self.token_attestation.len(),
+        if self.token_attestation.signature.len() != SIGNATURE_LEN {
+            return Err(TokenExchangeError::SignatureWrongLength(
+                self.token_attestation.signature.len(),
+            ));
+        }
+        if self.bearer_opening.len() != BEARER_OPENING_LEN {
+            return Err(TokenExchangeError::BearerOpeningWrongLength(
+                self.bearer_opening.len(),
             ));
         }
         Ok(())
@@ -118,10 +183,21 @@ impl TokenExchangeResponseV1 {
 mod tests {
     use super::*;
 
-    fn request() -> TokenExchangeRequestV1 {
-        TokenExchangeRequestV1 {
+    fn request() -> TokenRequest {
+        TokenRequest {
             code: "abc123".into(),
             code_verifier: "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1_gIZs5I".into(),
+        }
+    }
+
+    fn response() -> TokenResponse {
+        TokenResponse {
+            access_token: "gho_abc123".into(),
+            token_attestation: TokenAttestation {
+                attested_data: vec![0; 10],
+                signature: vec![0; SIGNATURE_LEN],
+            },
+            bearer_opening: vec![0; BEARER_OPENING_LEN],
         }
     }
 
@@ -131,9 +207,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_well_formed_response() {
+        response().validate().unwrap();
+    }
+
+    #[test]
     fn the_published_verifier_is_the_right_shape() {
-        // The section 7 conformance vector must satisfy REQ-PLAT-38, or the
-        // service would refuse a verifier the specification itself produces.
+        // The section 7 conformance vector must satisfy the request bounds, or
+        // the service would refuse a verifier the specification itself
+        // produces.
         assert_eq!(request().code_verifier.len(), CODE_VERIFIER_LEN);
         request().validate().unwrap();
     }
@@ -153,7 +235,7 @@ mod tests {
     #[test]
     fn refuses_whitespace_and_control_bytes_in_a_code() {
         for bad in ["ab cd", "ab\tcd", "ab\ncd", "ab\0cd"] {
-            let r = TokenExchangeRequestV1 {
+            let r = TokenRequest {
                 code: bad.into(),
                 ..request()
             };
@@ -173,7 +255,7 @@ mod tests {
             "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1+gIZs5I", // base64, not base64url
             "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1/gIZs5I",
         ] {
-            let r = TokenExchangeRequestV1 {
+            let r = TokenRequest {
                 code_verifier: bad.into(),
                 ..request()
             };
@@ -186,26 +268,77 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_over_long_response_field() {
-        let ok = TokenExchangeResponseV1 {
-            access_token: "t".into(),
-            token_attestation: vec![0; 10],
-            bearer_opening: vec![0; 16],
-        };
-        ok.validate().unwrap();
-
-        let mut r = ok.clone();
-        r.bearer_opening = vec![0; MAX_BEARER_OPENING_BYTES + 1];
-        assert!(matches!(
-            r.validate(),
-            Err(TokenExchangeError::BearerOpeningTooLong(_))
-        ));
-
-        let mut r = ok.clone();
+    fn refuses_an_empty_or_over_long_access_token() {
+        let mut r = response();
+        r.access_token = String::new();
+        assert_eq!(r.validate(), Err(TokenExchangeError::EmptyAccessToken));
         r.access_token = "t".repeat(MAX_ACCESS_TOKEN_BYTES + 1);
+        assert_eq!(
+            r.validate(),
+            Err(TokenExchangeError::AccessTokenTooLong(
+                MAX_ACCESS_TOKEN_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn refuses_whitespace_and_control_bytes_in_an_access_token() {
+        // The bearer is echoed into an `Authorization` header; a control byte
+        // there is a header the platform never sees as one.
+        for bad in ["gho_ab cd", "gho_ab\tcd", "gho_ab\r\ncd", "gho_ab\0cd"] {
+            let r = TokenResponse {
+                access_token: bad.into(),
+                ..response()
+            };
+            assert!(
+                matches!(
+                    r.validate(),
+                    Err(TokenExchangeError::AccessTokenNotPrintable(_))
+                ),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_empty_or_over_long_attested_data() {
+        let mut r = response();
+        r.token_attestation.attested_data = Vec::new();
+        assert_eq!(r.validate(), Err(TokenExchangeError::EmptyAttestedData));
+
+        let mut r = response();
+        r.token_attestation.attested_data = vec![0; MAX_ATTESTED_DATA_BYTES + 1];
         assert!(matches!(
             r.validate(),
-            Err(TokenExchangeError::AccessTokenTooLong(_))
+            Err(TokenExchangeError::AttestedDataTooLong(_))
         ));
+    }
+
+    #[test]
+    fn refuses_a_signature_that_is_not_exactly_recoverable_length() {
+        for len in [0, SIGNATURE_LEN - 1, SIGNATURE_LEN + 1] {
+            let mut r = response();
+            r.token_attestation.signature = vec![0; len];
+            assert_eq!(
+                r.validate(),
+                Err(TokenExchangeError::SignatureWrongLength(len)),
+                "accepted a {len}-byte signature"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_opening_that_is_not_exactly_what_the_circuit_opens() {
+        // A near miss is the dangerous one: a bounded check accepted both of
+        // these, and the circuit accepts neither.
+        for len in [0, BEARER_OPENING_LEN - 1, BEARER_OPENING_LEN + 1, 256] {
+            let mut r = response();
+            r.bearer_opening = vec![0; len];
+            assert_eq!(
+                r.validate(),
+                Err(TokenExchangeError::BearerOpeningWrongLength(len)),
+                "accepted a {len}-byte opening"
+            );
+        }
     }
 }

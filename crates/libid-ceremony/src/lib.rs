@@ -33,9 +33,12 @@
 //! * [`attestation`] -- the types of ceremony-common section 9.1 and the
 //!   encoder that lays them out. No decoder: whoever decodes also checks, and
 //!   that is the chain and the client.
-//! * [`token_exchange`] -- the GitHub Token-Exchange Service's own request and
-//!   response records. Its validation stays, because REQ-PLAT-37 to -40 put
-//!   that service's input validation on that service; no contract sees it.
+//! * [`token_exchange`] -- the GitHub Token Service's own request and response
+//!   records. Its validation stays, because REQ-PLAT-37 and REQ-PLAT-38 put
+//!   that service's input validation on that service; no contract sees it. The
+//!   route it is served on does not: section 6.3 leaves endpoint naming and
+//!   parsing bounds to the deployment, so the implementation states the route
+//!   and this crate states the records.
 
 pub mod attestation;
 pub mod token_exchange;
