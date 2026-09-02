@@ -77,6 +77,7 @@ pub use session::{
     prover_generic,
     root_store,
     verifier,
+    CommitmentOpening,
     ProverResult,
     ProverStep,
     UserInfoParams,
@@ -110,5 +111,15 @@ pub enum Error {
 
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Which direction of a transcript a commitment covers.
+///
+/// Re-exported because [`CommitmentOpening`] carries one, and a caller sorting
+/// its openings would otherwise have to depend on tlsn directly -- on an alpha
+/// tag, for one enum. With this, every field a caller READS off a
+/// `ProverResult` is nameable without tlsn -- `handshake` already was, from
+/// libid-transcript. Only `secrets` still hands back a tlsn type, and anything
+/// doing its own proof construction with it depends on tlsn regardless.
+pub use tlsn::transcript::Direction;
 
 pub mod attest;

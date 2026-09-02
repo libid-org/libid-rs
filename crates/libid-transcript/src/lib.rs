@@ -39,6 +39,7 @@ pub use types::TlsHandshakeData;
 pub use wire::{
     read_msg,
     write_msg,
+    AttestationWire,
 };
 
 /// Errors from transcript parsing and the wire protocol.

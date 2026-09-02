@@ -6,6 +6,7 @@
 
 use serde::{
     de::DeserializeOwned,
+    Deserialize,
     Serialize,
 };
 use tokio::io::{
@@ -22,6 +23,32 @@ use crate::{
 
 /// Maximum allowed message size (10 MB).
 const MAX_MSG_SIZE: usize = 10 * 1024 * 1024;
+
+/// The notary's answer to a completed session: the ceremony-common section 9.1
+/// record, and the signature over it.
+///
+/// It lives here rather than in either party because both speak it. The notary
+/// writes it -- onto the recovered socket for an MPC prover, and as the body of
+/// its ProxyMode attestation endpoint for a browser -- and a prover reads it
+/// back. Held privately on one side and mirrored on the other, a renamed field
+/// fails at parse time with an error that says nothing about which side moved.
+///
+/// The notary places nothing here that it derived by applying a profile rule:
+/// no handle, no account identifier, no client identifier, no chain address
+/// (REQ-COMMON-61). Every one is derivable from the revealed ranges, and a
+/// second signed representation can disagree with the bytes it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestationWire {
+    /// The exact bytes of ceremony-common section 9.1, as the notary encoded
+    /// them. Carried whole rather than re-encoded from a decoded form: the
+    /// signature is over these bytes, and a field reordered on the way through
+    /// derives a key nobody trusts.
+    pub attested_data: Vec<u8>,
+    /// EIP-191 over `keccak256(attested_data)`. The verifying side derives the
+    /// key from this pair alone and accepts no caller-supplied digest
+    /// (REQ-COMMON-49).
+    pub notary_signature: Vec<u8>,
+}
 
 /// Write a message with length prefix.
 ///
@@ -85,6 +112,37 @@ mod tests {
         write_msg(&mut a, &msg).await.unwrap();
         let got: Ping = read_msg(&mut b).await.unwrap();
         assert_eq!(got, msg);
+    }
+
+    /// The one message this protocol carries in production, written the way the
+    /// notary writes it and read the way a prover reads it. Held privately on
+    /// each side, this is exactly the round trip nothing would have checked.
+    #[tokio::test]
+    async fn the_notary_record_survives_the_wire() {
+        let (mut notary, mut prover) = tokio::io::duplex(64 * 1024);
+        let sent = AttestationWire {
+            attested_data: vec![0xde, 0xad, 0xbe, 0xef],
+            notary_signature: vec![7u8; 65],
+        };
+        write_msg(&mut notary, &sent).await.unwrap();
+        let got: AttestationWire = read_msg(&mut prover).await.unwrap();
+        assert_eq!(got, sent);
+    }
+
+    /// The shape a browser receives. The notary serves this same struct as the
+    /// body of its ProxyMode attestation endpoint, so its JSON is a public
+    /// contract -- and a Rust-to-Rust round trip would not notice it changing,
+    /// because both ends would change together.
+    #[test]
+    fn the_record_serialises_to_the_shape_its_readers_expect() {
+        let record = AttestationWire {
+            attested_data: vec![0xde, 0xad, 0xbe, 0xef],
+            notary_signature: vec![1, 2, 3],
+        };
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"attested_data":[222,173,190,239],"notary_signature":[1,2,3]}"#
+        );
     }
 
     #[tokio::test]
