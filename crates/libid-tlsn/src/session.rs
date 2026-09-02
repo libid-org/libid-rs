@@ -34,10 +34,12 @@ use tlsn::{
     hash::HashAlgId,
     prover::ProverOutput,
     transcript::{
+        Direction,
         PartialTranscript,
         TlsTranscript,
         TranscriptCommitConfig,
         TranscriptCommitment,
+        TranscriptSecret,
     },
     verifier::{
         VerifierCommitStart,
@@ -204,6 +206,29 @@ impl ProverStep {
     }
 }
 
+/// The blinder that opens one commitment this session made.
+///
+/// A committed range is a hash of the plaintext and this value, so the party
+/// that later proves something about those bytes needs both. The prover is the
+/// only party that ever holds it: the notary sees the commitment, never the
+/// opening, which is the whole point of committing rather than revealing.
+///
+/// It is surfaced because a caller that commits a credential must hand the
+/// opening on to whoever proves over it — the browser, for a bearer this
+/// service exchanged. Without it the caller holds an attestation nobody can
+/// build a proof against.
+#[derive(Clone)]
+pub struct CommitmentOpening {
+    /// Which direction of the transcript the committed range belongs to.
+    pub direction: Direction,
+    /// The committed ranges, in the same shape the layout stated them, so a
+    /// caller can match an opening against the range it asked to commit
+    /// without converting anything.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// The blinder itself. Sixteen bytes, as the commitment scheme fixes.
+    pub blinder: Vec<u8>,
+}
+
 /// Result from the MPC-TLS prover.
 pub struct ProverResult<T> {
     /// The HTTP response body from the platform API (decoded, headers stripped).
@@ -212,6 +237,9 @@ pub struct ProverResult<T> {
     pub secrets: Secrets,
     /// Extracted TLS handshake data.
     pub handshake: TlsHandshakeData,
+    /// One opening per commitment this session made, in the order the layouts
+    /// stated them. Empty when the session committed nothing.
+    pub commitment_openings: Vec<CommitmentOpening>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
 }
@@ -591,9 +619,33 @@ where
             })
             .transcript(transcript)
             .transcript_commitments(
-                prover_output.transcript_secrets,
+                prover_output.transcript_secrets.clone(),
                 prover_output.transcript_commitments,
             );
+        // Taken before the secrets move into the request: the builder consumes
+        // them and `Secrets` exposes no accessor, so this is the only point at
+        // which a caller can still be handed what opens its own commitments.
+        //
+        // A secret of a kind this cannot open is refused rather than skipped:
+        // dropping one would hand the caller fewer openings than it made
+        // commitments, and it would find that out later, somewhere the reason
+        // is no longer visible.
+        let commitment_openings: Vec<CommitmentOpening> = prover_output
+            .transcript_secrets
+            .into_iter()
+            .map(|secret| match secret {
+                TranscriptSecret::Hash(hash) => Ok(CommitmentOpening {
+                    direction: hash.direction,
+                    ranges: hash.idx.into_inner(),
+                    blinder: hash.blinder.as_bytes().to_vec(),
+                }),
+                other => Err(Error::MpcTlsFailed {
+                    detail: format!(
+                        "commitment secret of a kind this build cannot open: {other:?}"
+                    ),
+                }),
+            })
+            .collect::<Result<_>>()?;
         // The request itself goes nowhere: the notary answers a session with the
         // section 9.1 record and reads no attestation request. `build` is still
         // what produces `secrets`, so it stays.
@@ -609,7 +661,7 @@ where
         })?;
         handle.close();
 
-        Ok((body, secrets, handshake))
+        Ok((body, secrets, handshake, commitment_openings))
     };
     tokio::pin!(setup);
 
@@ -617,7 +669,7 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
-    let (body, secrets, handshake) = tokio::select! {
+    let (body, secrets, handshake, commitment_openings) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
@@ -640,6 +692,7 @@ where
         response_body: body.to_vec(),
         secrets,
         handshake,
+        commitment_openings,
         recovered_io,
     })
 }
