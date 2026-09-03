@@ -52,15 +52,8 @@ pub enum TokenExchangeError {
     AccessTokenNotPrintable(usize),
     #[error("attestedData is empty")]
     EmptyAttestedData,
-    #[error(
-        "the attestation is {0} bytes, over the {MAX_ATTESTED_DATA_BYTES}-byte bound"
-    )]
+    #[error("attestedData is {0} bytes, over the {MAX_ATTESTED_DATA_BYTES}-byte bound")]
     AttestedDataTooLong(usize),
-    #[error(
-        "the attestation is {0} bytes, too short to carry a {SIGNATURE_LEN}-byte \
-         signature and any data"
-    )]
-    AttestationTooShort(usize),
     #[error("signature is {0} bytes, not the {SIGNATURE_LEN} a notary signature is")]
     SignatureWrongLength(usize),
     #[error(
@@ -101,47 +94,6 @@ pub struct TokenAttestation {
     pub attested_data: Vec<u8>,
     /// The notary signature authenticating those exact bytes.
     pub signature: Vec<u8>,
-}
-
-impl TokenAttestation {
-    /// The single byte string the wire carries: the attested data, then the
-    /// signature.
-    ///
-    /// One string rather than two fields because that is the room the response
-    /// interface gives it -- `tokenAttestation` is one canonical unpadded
-    /// base64url value. A notary signature is a fixed [`SIGNATURE_LEN`] bytes,
-    /// so it is the tail, and the split needs no length prefix and no framing.
-    ///
-    /// THE LAYOUT IS NOT IN THE SPECIFICATION. REQ-PLAT-45 requires the
-    /// returned attestation to carry the notary's signature and the response
-    /// interface gives it one string to travel in, but how the two sit inside
-    /// that string is left to the components sharing it. Every one of them
-    /// reads this function, so they agree; an implementation written from the
-    /// specification alone would have to guess, which is worth a sentence
-    /// there.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.attested_data.len() + self.signature.len());
-        out.extend_from_slice(&self.attested_data);
-        out.extend_from_slice(&self.signature);
-        out
-    }
-
-    /// Split one wire string back into the pair.
-    ///
-    /// A string too short to hold a signature is refused rather than read as
-    /// an empty-data attestation: the two would be indistinguishable, and the
-    /// second is a record no verifier can check.
-    pub fn decode(bytes: &[u8]) -> Result<Self, TokenExchangeError> {
-        let split = bytes
-            .len()
-            .checked_sub(SIGNATURE_LEN)
-            .filter(|n| *n > 0)
-            .ok_or(TokenExchangeError::AttestationTooShort(bytes.len()))?;
-        Ok(Self {
-            attested_data: bytes[..split].to_vec(),
-            signature: bytes[split..].to_vec(),
-        })
-    }
 }
 
 /// What comes back. `access_token` and `bearer_opening` both stay inside the
@@ -208,13 +160,10 @@ impl TokenResponse {
         if self.token_attestation.attested_data.is_empty() {
             return Err(TokenExchangeError::EmptyAttestedData);
         }
-        // REQ-PLAT-39 bounds the DECODED `tokenAttestation`, and that is this
-        // pair together -- so the bound belongs on what `encode` produces.
-        // Measured on the data alone it would admit a response a signature
-        // over, which the browser then refuses for a reason nothing here said.
-        let attestation_len = self.token_attestation.attested_data.len() + SIGNATURE_LEN;
-        if attestation_len > MAX_ATTESTED_DATA_BYTES {
-            return Err(TokenExchangeError::AttestedDataTooLong(attestation_len));
+        if self.token_attestation.attested_data.len() > MAX_ATTESTED_DATA_BYTES {
+            return Err(TokenExchangeError::AttestedDataTooLong(
+                self.token_attestation.attested_data.len(),
+            ));
         }
         if self.token_attestation.signature.len() != SIGNATURE_LEN {
             return Err(TokenExchangeError::SignatureWrongLength(
@@ -233,55 +182,6 @@ impl TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The wire carries one string, and the pair has to survive the trip:
-    /// everything downstream reads the attested data by offset and recovers a
-    /// key from the signature, so a byte moved between them derives a key
-    /// nobody trusts.
-    #[test]
-    fn an_attestation_survives_the_one_string_it_travels_in() {
-        let attestation = TokenAttestation {
-            attested_data: (0u8..=200).collect(),
-            signature: vec![0xab; SIGNATURE_LEN],
-        };
-        let encoded = attestation.encode();
-        assert_eq!(encoded.len(), 201 + SIGNATURE_LEN);
-        assert_eq!(TokenAttestation::decode(&encoded).unwrap(), attestation);
-    }
-
-    /// A string with room for a signature and nothing else decodes to empty
-    /// attested data, which is a record no verifier can check. Refused here,
-    /// where the reason is still legible.
-    #[test]
-    fn a_string_too_short_to_hold_both_is_refused() {
-        for len in [0, 1, SIGNATURE_LEN - 1, SIGNATURE_LEN] {
-            assert!(
-                matches!(
-                    TokenAttestation::decode(&vec![0u8; len]),
-                    Err(TokenExchangeError::AttestationTooShort(_))
-                ),
-                "{len} bytes must not decode"
-            );
-        }
-        assert!(TokenAttestation::decode(&[0u8; SIGNATURE_LEN + 1]).is_ok());
-    }
-
-    /// The bound is on what travels, not on half of it. Attested data that
-    /// exactly fills the bound leaves no room for the signature beside it.
-    #[test]
-    fn the_bound_covers_the_signature_travelling_with_the_data() {
-        let mut response = response();
-        response.token_attestation.attested_data =
-            vec![0u8; MAX_ATTESTED_DATA_BYTES - SIGNATURE_LEN];
-        assert!(response.validate().is_ok());
-
-        response.token_attestation.attested_data =
-            vec![0u8; MAX_ATTESTED_DATA_BYTES - SIGNATURE_LEN + 1];
-        assert!(matches!(
-            response.validate(),
-            Err(TokenExchangeError::AttestedDataTooLong(_))
-        ));
-    }
 
     fn request() -> TokenRequest {
         TokenRequest {
