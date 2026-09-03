@@ -65,51 +65,57 @@ pub fn extract_response_body(recv: &[u8]) -> Result<Vec<u8>> {
 
     if let Some(te) = extract_header(recv, "Transfer-Encoding") {
         if te.contains("chunked") {
-            return Ok(decode_chunked_body(raw_body));
+            return decode_chunked_body(raw_body);
         }
     }
 
     Ok(raw_body.to_vec())
 }
 
-fn decode_chunked_body(raw: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut pos = 0;
-    while pos < raw.len() {
-        let size_end = match raw
-            .get(pos..)
-            .and_then(|s| s.windows(2).position(|w| w == b"\r\n"))
-        {
-            Some(p) => match pos.checked_add(p) {
-                Some(v) => v,
-                None => break,
-            },
-            None => break,
+/// Join a chunked body's chunks.
+///
+/// Every malformed input is an error rather than a shorter body. The reveal
+/// ranges are computed over what this returns, so a silent truncation would
+/// have the prover select ranges over bytes the server never sent -- and the
+/// notary would sign that selection without anyone noticing.
+fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>> {
+    let bad = |detail: &str| Error::Transcript {
+        detail: format!("chunked body: {detail}"),
+    };
+
+    let mut out = Vec::new();
+    let mut rest = raw;
+    loop {
+        let (header_len, size) = match httparse::parse_chunk_size(rest) {
+            Ok(httparse::Status::Complete(v)) => v,
+            Ok(httparse::Status::Partial) => {
+                return Err(bad("ends inside a chunk header"))
+            }
+            Err(_) => return Err(bad("chunk size is not hexadecimal")),
         };
-        let size_str = std::str::from_utf8(raw.get(pos..size_end).unwrap_or_default())
-            .unwrap_or("0");
-        let chunk_size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
-        if chunk_size == 0 {
-            break;
+        if size == 0 {
+            return Ok(out);
         }
-        let data_start = match size_end.checked_add(2) {
-            Some(v) => v,
-            None => break,
-        };
-        let data_end = match data_start.checked_add(chunk_size) {
-            Some(v) => v,
-            None => break,
-        };
-        if data_end > raw.len() {
-            break;
+        let size =
+            usize::try_from(size).map_err(|_| bad("chunk larger than this machine"))?;
+        let body_end = header_len
+            .checked_add(size)
+            .ok_or_else(|| bad("chunk length overflows"))?;
+        let chunk = rest
+            .get(header_len..body_end)
+            .ok_or_else(|| bad("chunk is shorter than its declared size"))?;
+        out.extend_from_slice(chunk);
+
+        // The CRLF that closes a chunk. Its absence means the framing is not
+        // what it claims, and the next size would be read from the wrong place.
+        let after = rest
+            .get(body_end..body_end + 2)
+            .ok_or_else(|| bad("ends before a chunk terminator"))?;
+        if after != b"\r\n" {
+            return Err(bad("chunk is not terminated by CRLF"));
         }
-        result.extend_from_slice(&raw[data_start..data_end]);
-        pos = match data_end.checked_add(2) {
-            Some(v) => v,
-            None => break,
-        };
+        rest = &rest[body_end + 2..];
     }
-    result
 }
 
 /// Find the byte range of a JSON string field value.
@@ -359,6 +365,26 @@ pub fn compute_id_snippet_range(
 
 #[cfg(test)]
 mod tests {
+    /// A chunk header that is not a hex size used to end the body silently:
+    /// the size parsed as `unwrap_or(0)`, the loop hit `break`, and the caller
+    /// got a short body with no error. The reveal ranges are computed from
+    /// that body, so the prover would select them over bytes the server never
+    /// sent -- and never learn.
+    #[test]
+    fn a_malformed_chunk_size_is_an_error_not_a_short_body() {
+        let recv = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+5\r\nhello\r\nzz\r\nworld\r\n0\r\n\r\n";
+        assert!(super::extract_response_body(recv).is_err());
+    }
+
+    #[test]
+    fn a_truncated_chunk_is_an_error_too() {
+        // The size says 20 bytes and 5 follow.
+        let recv = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+14\r\nhello";
+        assert!(super::extract_response_body(recv).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -24,6 +24,7 @@ libid-crypto = { path = "crates/libid-crypto", version = "0.3.0" }
 libid-signer = { path = "crates/libid-signer", version = "0.3.0" }
 libid-transcript = { path = "crates/libid-transcript", version = "0.3.0" }
 libid-attestations = { path = "crates/libid-attestations", version = "0.3.0" }
+libid-ceremony = { path = "crates/libid-ceremony", version = "0.3.0" }
 
 alloy = { version = "1", default-features = false }
 alloy-primitives = { version = "1", features = ["serde"] }
@@ -34,7 +35,14 @@ alloy-sol-types = "1"
 # pinned to the 1.x line so cargo unifies them with whatever alloy resolves.
 aws-config = "1"
 aws-sdk-kms = "1"
+base64 = "0.22"
+# Pinned exactly: the encoded bytes are a signed preimage, so a layout change
+# in a patch release would change what every notary signs.
+bincode = { version = "=2.0.1", features = ["derive"] }
 hex = "0.4"
+# Chunk-size parsing. Hand-rolling it is how a malformed chunk becomes a short
+# body instead of an error.
+httparse = "1"
 http-body-util = "0.1"
 hyper = { version = "1.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["full"] }
@@ -42,6 +50,7 @@ k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Upstream TLSNotary, same pin as the original monorepo. A GIT dependency: any crate that

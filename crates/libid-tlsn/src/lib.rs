@@ -60,13 +60,24 @@
 
 mod session;
 
+pub use http_body_util::Full as HttpBody;
+/// The request `prover_generic` sends, and the pieces to build one.
+///
+/// Re-exported so a caller states its own headers without taking a direct
+/// dependency on the HTTP crates this uses. A notarized request is bytes a
+/// verifier compares against a profile, so the party that knows the profile
+/// writes them -- this library injects none.
+pub use hyper::{
+    body::Bytes,
+    Request as HttpRequest,
+};
 pub use session::{
     extract_handshake_data,
     prover,
     prover_generic,
     root_store,
     verifier,
-    HttpRequestSpec,
+    CommitmentOpening,
     ProverResult,
     ProverStep,
     UserInfoParams,
@@ -100,3 +111,15 @@ pub enum Error {
 
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Which direction of a transcript a commitment covers.
+///
+/// Re-exported because [`CommitmentOpening`] carries one, and a caller sorting
+/// its openings would otherwise have to depend on tlsn directly -- on an alpha
+/// tag, for one enum. With this, every field a caller READS off a
+/// `ProverResult` is nameable without tlsn -- `handshake` already was, from
+/// libid-transcript. Only `secrets` still hands back a tlsn type, and anything
+/// doing its own proof construction with it depends on tlsn regardless.
+pub use tlsn::transcript::Direction;
+
+pub mod attest;

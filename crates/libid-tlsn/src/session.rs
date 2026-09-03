@@ -6,6 +6,7 @@ use hyper::{
     StatusCode,
 };
 use hyper_util::rt::TokioIo;
+use libid_transcript::ceremony::Layout;
 use std::future::IntoFuture;
 use tlsn::{
     attestation::{
@@ -33,10 +34,12 @@ use tlsn::{
     hash::HashAlgId,
     prover::ProverOutput,
     transcript::{
+        Direction,
         PartialTranscript,
         TlsTranscript,
         TranscriptCommitConfig,
         TranscriptCommitment,
+        TranscriptSecret,
     },
     verifier::{
         VerifierCommitStart,
@@ -78,8 +81,6 @@ use crate::{
     Error,
     Result,
 };
-
-use std::ops::Range;
 
 /// Maximum bytes the prover may send in the MPC-TLS session (4 KB). The
 /// verifier rejects sessions configured above this.
@@ -140,19 +141,6 @@ fn driver_finished_early<T, E: std::fmt::Display>(
     Error::MpcTlsFailed { detail }
 }
 
-/// Sub-steps within the MPC-TLS prover phase, reported via callback.
-#[derive(Debug, Clone, Copy)]
-pub enum ProverStep {
-    /// MPC-TLS session established with notary.
-    MpcSetupComplete,
-    /// TLS handshake completed via MPC.
-    TlsHandshakeComplete,
-    /// Platform user data fetched over MPC-TLS.
-    PlatformDataFetched,
-    /// MPC proof finalized.
-    MpcProofFinalized,
-}
-
 /// The WebPKI root store both sides validate server certificates against.
 pub fn root_store() -> RootCertStore {
     RootCertStore {
@@ -185,20 +173,73 @@ pub fn extract_handshake_data(
     })
 }
 
+/// A phase boundary of a prover session, in the order they occur.
+///
+/// Reported through `on_progress` so a caller can drive something typed off
+/// them -- a progress indicator for a browser waiting out a server-side
+/// exchange, which takes seconds. The same four boundaries are `tracing`
+/// events for operators; this is the interface, because log text is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProverStep {
+    /// MPC-TLS session established with the notary.
+    MpcSetupComplete,
+    /// TLS handshake completed through it.
+    TlsHandshakeComplete,
+    /// The platform answered.
+    PlatformDataFetched,
+    /// The proof is finalised and the session can be closed.
+    MpcProofFinalized,
+}
+
+impl ProverStep {
+    /// How far through the session this boundary is, in `(0, 1]`.
+    ///
+    /// The phases are not equal in wall-clock time -- setup and proving
+    /// dominate -- so this is a position, not an estimate of remaining time.
+    pub fn fraction(self) -> f32 {
+        match self {
+            Self::MpcSetupComplete => 0.25,
+            Self::TlsHandshakeComplete => 0.5,
+            Self::PlatformDataFetched => 0.75,
+            Self::MpcProofFinalized => 1.0,
+        }
+    }
+}
+
+/// The blinder that opens one commitment this session made.
+///
+/// A committed range is a hash of the plaintext and this value, so the party
+/// that later proves something about those bytes needs both. The prover is the
+/// only party that ever holds it: the notary sees the commitment, never the
+/// opening, which is the whole point of committing rather than revealing.
+///
+/// It is surfaced because a caller that commits a credential must hand the
+/// opening on to whoever proves over it — the browser, for a bearer this
+/// service exchanged. Without it the caller holds an attestation nobody can
+/// build a proof against.
+#[derive(Clone)]
+pub struct CommitmentOpening {
+    /// Which direction of the transcript the committed range belongs to.
+    pub direction: Direction,
+    /// The committed ranges, in the same shape the layout stated them, so a
+    /// caller can match an opening against the range it asked to commit
+    /// without converting anything.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// The blinder itself. Sixteen bytes, as the commitment scheme fixes.
+    pub blinder: Vec<u8>,
+}
+
 /// Result from the MPC-TLS prover.
 pub struct ProverResult<T> {
     /// The HTTP response body from the platform API (decoded, headers stripped).
     pub response_body: Vec<u8>,
-    /// Revealed recv segments — the exact bytes the prover disclosed to the notary.
-    /// The notary hashes each segment as `double_hash_leaf("recv:", segment)` to
-    /// build the `recv:` Merkle leaves of the EvmProof. One entry per revealed range.
-    pub recv_segments: Vec<Vec<u8>>,
-    /// The attestation request to send to the notary.
-    pub request: Request,
     /// The TLS secrets for proof construction.
     pub secrets: Secrets,
     /// Extracted TLS handshake data.
     pub handshake: TlsHandshakeData,
+    /// One opening per commitment this session made, in the order the layouts
+    /// stated them. Empty when the session committed nothing.
+    pub commitment_openings: Vec<CommitmentOpening>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
 }
@@ -215,25 +256,6 @@ pub struct VerifierResult<T> {
     pub transcript_commitments: Vec<TranscriptCommitment>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
-}
-
-/// The HTTPS request the prover performs over MPC-TLS.
-#[derive(Debug, Clone, Copy)]
-pub struct HttpRequestSpec<'a> {
-    /// API host (SNI and Host header), e.g. `"api.x.com"`.
-    pub api_host: &'a str,
-    /// Request path, e.g. `"/2/users/me"`.
-    pub path: &'a str,
-    /// HTTP method, e.g. `"GET"`.
-    pub method: &'a str,
-    /// Optional request body; when set, `Content-Type: application/json` is
-    /// added.
-    pub body: Option<&'a str>,
-    /// Optional bearer token, sent as `Authorization: Bearer <token>`. `None`
-    /// for unauthenticated endpoints (e.g. a public JWKS fetch).
-    pub bearer_token: Option<&'a str>,
-    /// User-Agent header value.
-    pub user_agent: &'a str,
 }
 
 /// Parameters for the user-info prover flow ([`prover`]).
@@ -257,29 +279,43 @@ pub struct UserInfoParams<'a> {
 /// Run the MPC-TLS prover to fetch user data from a platform API, revealing
 /// the username snippet (and the id snippet when configured).
 #[instrument(skip_all, fields(api_host = params.api_host))]
-pub async fn prover<T, F>(
+pub async fn prover<T>(
     socket: T,
     access_token: &str,
     params: &UserInfoParams<'_>,
-    on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
-    F: Fn(ProverStep),
 {
     let username_field = params.username_field;
     let id_field = params.id_field;
+    // The headers this flow sends, stated here rather than injected by the
+    // library. A notarized request is bytes a verifier compares against a
+    // profile, so whoever knows the profile writes them.
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!(
+            "https://{}{}",
+            params.api_host, params.user_info_path
+        ))
+        .header("Host", params.api_host)
+        .header("Connection", "close")
+        .header("Accept", "application/json")
+        .header("User-Agent", params.user_agent)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .body(http_body_util::Full::new(Bytes::new()))
+        .map_err(|e| Error::MpcTlsFailed {
+            detail: format!("request build: {e}"),
+        })?;
+
     prover_generic(
         socket,
-        &HttpRequestSpec {
-            api_host: params.api_host,
-            path: params.user_info_path,
-            method: "GET",
-            body: None,
-            bearer_token: Some(access_token),
-            user_agent: params.user_agent,
-        },
-        |recv| {
+        request,
+        // This flow predates the ceremony layouts and still selects the old
+        // sparse ranges: the request line and `Host` revealed, everything else
+        // of the response committed whole. It does NOT tile, so what it
+        // produces is not a ceremony attestation. It goes at cutover.
+        |sent, recv| {
             let mut ranges =
                 vec![
                     libid_transcript::compute_field_snippet_range(recv, username_field)
@@ -299,37 +335,78 @@ where
                     ranges.push(range);
                 }
             }
-            Ok(ranges)
+            Ok((
+                Layout {
+                    reveal: find_notary_reveal_ranges(sent),
+                    commit: find_presentation_commit_ranges(sent),
+                },
+                Layout {
+                    reveal: ranges,
+                    commit: core::iter::once(0..recv.len()).collect(),
+                },
+            ))
         },
-        on_progress,
+        // This flow goes at cutover and nothing watches it run.
+        |_| {},
     )
     .await
 }
 
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
-/// The `compute_reveal_ranges` closure receives the full `recv` transcript
-/// data after the HTTP exchange completes and must return the byte ranges
-/// within `recv` to selectively disclose. Each range becomes a separate
-/// Merkle leaf in the notary's transcript tree. To reveal the entire
-/// received transcript (as a JWKS-style notary requires), return
-/// `vec![0..recv.len()]`.
+/// `select_layout` receives both complete transcripts once the HTTP exchange
+/// finishes and returns, for each direction, what to reveal and what to commit.
+/// The prover chooses that -- it is the party holding the session keys, and
+/// nobody above it can decide on its behalf.
 ///
-/// Use [`libid_transcript::compute_field_reveal_range`] and friends inside
-/// the closure to locate JSON field values in the response body.
-#[instrument(skip_all, fields(api_host = request.api_host))]
-pub async fn prover_generic<T, F, R>(
+/// A caller producing a ceremony attestation calls
+/// `libid_transcript::ceremony` here and returns what it gives back: those
+/// layouts derive each direction's commitments as the complement of its
+/// reveals, so the direction tiles by construction, which is what the Platform
+/// Verifier's coverage check demands. A caller doing something else -- the
+/// JWKS session reads a public document and reveals all of it -- states its
+/// own.
+///
+/// Each revealed range becomes a separate Merkle leaf in the notary's
+/// transcript tree. [`libid_transcript::compute_field_reveal_range`] and
+/// friends locate JSON field values in a response body.
+///
+/// # Following a session
+///
+/// This is slow -- setup and proving dominate -- so every phase boundary is
+/// reported twice, to two different audiences. A `tracing` event inside this
+/// function's span, for whoever reads the logs; and [`ProverStep`] through
+/// `on_progress`, for a caller driving something typed off it.
+///
+/// The browser has its own progress from the tlsn wasm prover and never
+/// reaches this function. The caller this exists for is a server that
+/// notarizes on someone's behalf -- the GitHub Token-Exchange Service, whose
+/// HTTP caller waits out the whole session -- and which cannot report phases
+/// by parsing log lines.
+#[instrument(skip_all)]
+pub async fn prover_generic<T, S, F>(
     socket: T,
-    request: &HttpRequestSpec<'_>,
-    compute_reveal_ranges: R,
+    request: hyper::Request<http_body_util::Full<Bytes>>,
+    select_layout: S,
     on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+    S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
     F: Fn(ProverStep),
-    R: FnOnce(&[u8]) -> Result<Vec<Range<usize>>>,
 {
-    let api_host = request.api_host;
+    // SNI and the TCP peer come from the request's own authority. A caller
+    // that set no host has not said which server it means to reach.
+    let api_host = request
+        .uri()
+        .host()
+        .ok_or_else(|| Error::MpcTlsFailed {
+            detail: "request URI carries no host".into(),
+        })?
+        .to_string();
+    let api_host = api_host.as_str();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -361,6 +438,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("commit: {e}"),
             })?;
+        info!("MPC-TLS setup complete");
         on_progress(ProverStep::MpcSetupComplete);
 
         info!("Connecting to {} API", api_host);
@@ -383,6 +461,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("connect: {e}"),
             })?;
+        info!("TLS handshake complete");
         on_progress(ProverStep::TlsHandshakeComplete);
 
         let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
@@ -396,41 +475,10 @@ where
         // exchange; the guard reaps it if the session bails out first.
         let _conn_task = AbortOnDrop::new(tokio::spawn(conn));
 
-        let http_request = {
-            let mut builder = hyper::Request::builder()
-                .method(request.method)
-                .uri(request.path)
-                .header("Host", api_host)
-                .header("Connection", "close")
-                .header("Accept", "application/json")
-                .header("User-Agent", request.user_agent);
-            if let Some(token) = request.bearer_token {
-                builder = builder.header("Authorization", format!("Bearer {}", token));
-            }
-            if request.body.is_some() {
-                builder = builder.header("Content-Type", "application/json");
-            }
-            if let Some(post_body) = request.body {
-                builder
-                    .body(http_body_util::Full::new(Bytes::from(
-                        post_body.to_string(),
-                    )))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            } else {
-                builder
-                    .body(http_body_util::Full::new(Bytes::new()))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            }
-        };
-
-        info!("Sending {} {}", request.method, request.path);
+        info!("Sending {method} {path}");
         let response =
             sender
-                .send_request(http_request)
+                .send_request(request)
                 .await
                 .map_err(|e| Error::MpcTlsFailed {
                     detail: format!("send request: {e}"),
@@ -468,31 +516,36 @@ where
         let transcript = prover.transcript().clone();
         let sent = transcript.sent();
         let recv = transcript.received();
-        let reveal_recv_ranges = compute_reveal_ranges(recv)?;
+        // The ceremony layouts derive their commitments as the complement of
+        // the reveals, so each direction tiles by construction -- which is what
+        // the Platform Verifier's coverage check demands.
+        // The prover chooses what it reveals -- that is what a prover IS. One
+        // parameter says so, and there is no second mechanism to disagree with
+        // it. A caller wanting the specification's layouts calls
+        // `libid_transcript::ceremony` here and returns what it gives back.
+        let (sent_layout, recv_layout) = select_layout(sent, recv)?;
 
-        // Save the revealed recv segments BEFORE the transcript is moved.
-        // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
-        // saving them here lets the ZK prover verify the full chain.
-        let recv_segments: Vec<Vec<u8>> = reveal_recv_ranges
-            .iter()
-            .map(|r| recv[r.clone()].to_vec())
-            .collect();
+        let reveal_recv_ranges = recv_layout.reveal.clone();
 
-        let notary_sent_ranges = find_notary_reveal_ranges(sent);
+        let notary_sent_ranges = sent_layout.reveal.clone();
 
         let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-        for range in find_presentation_commit_ranges(sent) {
+        let (sent_commits, recv_commits) =
+            (sent_layout.commit.clone(), recv_layout.commit.clone());
+        for range in sent_commits {
             tc_builder
                 .commit_sent(&range)
                 .map_err(|e| Error::MpcTlsFailed {
                     detail: format!("commit sent: {e}"),
                 })?;
         }
-        tc_builder
-            .commit_recv(&(0..recv.len()))
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("commit recv: {e}"),
-            })?;
+        for range in recv_commits {
+            tc_builder
+                .commit_recv(&range)
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("commit recv: {e}"),
+                })?;
+        }
         let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
             detail: format!("transcript commit config: {e}"),
         })?;
@@ -566,10 +619,37 @@ where
             })
             .transcript(transcript)
             .transcript_commitments(
-                prover_output.transcript_secrets,
+                prover_output.transcript_secrets.clone(),
                 prover_output.transcript_commitments,
             );
-        let (att_request, secrets) = req_builder
+        // Taken before the secrets move into the request: the builder consumes
+        // them and `Secrets` exposes no accessor, so this is the only point at
+        // which a caller can still be handed what opens its own commitments.
+        //
+        // A secret of a kind this cannot open is refused rather than skipped:
+        // dropping one would hand the caller fewer openings than it made
+        // commitments, and it would find that out later, somewhere the reason
+        // is no longer visible.
+        let commitment_openings: Vec<CommitmentOpening> = prover_output
+            .transcript_secrets
+            .into_iter()
+            .map(|secret| match secret {
+                TranscriptSecret::Hash(hash) => Ok(CommitmentOpening {
+                    direction: hash.direction,
+                    ranges: hash.idx.into_inner(),
+                    blinder: hash.blinder.as_bytes().to_vec(),
+                }),
+                other => Err(Error::MpcTlsFailed {
+                    detail: format!(
+                        "commitment secret of a kind this build cannot open: {other:?}"
+                    ),
+                }),
+            })
+            .collect::<Result<_>>()?;
+        // The request itself goes nowhere: the notary answers a session with the
+        // section 9.1 record and reads no attestation request. `build` is still
+        // what produces `secrets`, so it stays.
+        let (_att_request, secrets) = req_builder
             .build(&CryptoProvider::default())
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("attestation request: {e}"),
@@ -581,7 +661,7 @@ where
         })?;
         handle.close();
 
-        Ok((body, recv_segments, att_request, secrets, handshake))
+        Ok((body, secrets, handshake, commitment_openings))
     };
     tokio::pin!(setup);
 
@@ -589,7 +669,7 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
-    let (body, recv_segments, att_request, secrets, handshake) = tokio::select! {
+    let (body, secrets, handshake, commitment_openings) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
@@ -610,10 +690,9 @@ where
 
     Ok(ProverResult {
         response_body: body.to_vec(),
-        recv_segments,
-        request: att_request,
         secrets,
         handshake,
+        commitment_openings,
         recovered_io,
     })
 }
