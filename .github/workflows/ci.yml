@@ -191,6 +191,7 @@ jobs:
           cargo publish --dry-run
           -p libid-crypto
           -p libid-transcript
+          -p libid-ceremony
           -p libid-signer
 
   # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [package]
 name = "libid-ceremony"
-description = "The attestation record a libID notary signs: the section 9.1 types and their encoder."
+description = "The attestation record a libID notary signs: the attested-data types a Platform Profile pins, and their encoder."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
