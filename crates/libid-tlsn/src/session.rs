@@ -352,6 +352,33 @@ where
     .await
 }
 
+/// Rewrite the request's URI to origin-form before it goes on the wire.
+///
+/// `hyper::client::conn::http1` writes the request-target exactly as the
+/// `Uri` displays (`Client::encode` in `proto/h1/role.rs`); only hyper-util's
+/// pooled client rewrites it, and [`prover_generic`] drives a raw connection.
+/// A caller hands us an absolute URI because that is where the host comes
+/// from, so left alone the request line would read
+/// `GET https://www.googleapis.com/oauth2/v3/certs HTTP/1.1` -- valid HTTP,
+/// but not the origin-form line the Platform Verifiers and `IdentityJwksRoots`
+/// pin, so the session would be refused on chain.
+///
+/// Only the URI changes: the `Host` header the caller set stays as it is.
+fn origin_form<B>(request: &mut hyper::Request<B>) -> Result<()> {
+    let target = match request.uri().path_and_query() {
+        Some(path) => {
+            let mut parts = hyper::http::uri::Parts::default();
+            parts.path_and_query = Some(path.clone());
+            hyper::Uri::from_parts(parts).map_err(|e| Error::MpcTlsFailed {
+                detail: format!("origin-form request-target: {e}"),
+            })?
+        }
+        None => hyper::Uri::default(),
+    };
+    *request.uri_mut() = target;
+    Ok(())
+}
+
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
 /// `select_layout` receives both complete transcripts once the HTTP exchange
@@ -383,10 +410,14 @@ where
 /// notarizes on someone's behalf -- the GitHub Token-Exchange Service, whose
 /// HTTP caller waits out the whole session -- and which cannot report phases
 /// by parsing log lines.
+///
+/// The request's URI must be absolute -- the host names the server -- but the
+/// wire carries the request-target in origin-form (`GET /path?query HTTP/1.1`),
+/// which is the line every verifier pins. See [`origin_form`].
 #[instrument(skip_all)]
 pub async fn prover_generic<T, S, F>(
     socket: T,
-    request: hyper::Request<http_body_util::Full<Bytes>>,
+    mut request: hyper::Request<http_body_util::Full<Bytes>>,
     select_layout: S,
     on_progress: F,
 ) -> Result<ProverResult<T>>
@@ -407,6 +438,7 @@ where
     let api_host = api_host.as_str();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    origin_form(&mut request)?;
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -837,4 +869,42 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
         transcript_commitments,
         recovered_io,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(uri: &str) -> hyper::Request<()> {
+        hyper::Request::builder()
+            .uri(uri)
+            .header("Host", "www.googleapis.com")
+            .body(())
+            .expect("valid request")
+    }
+
+    #[test]
+    fn origin_form_keeps_path_and_query() {
+        let mut request = request("https://www.googleapis.com/p?q=1");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().to_string(), "/p?q=1");
+    }
+
+    #[test]
+    fn origin_form_keeps_a_bare_path() {
+        let mut request = request("https://www.googleapis.com/p");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().to_string(), "/p");
+    }
+
+    #[test]
+    fn origin_form_leaves_the_host_header_alone() {
+        let mut request = request("https://www.googleapis.com/oauth2/v3/certs");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().host(), None);
+        assert_eq!(
+            request.headers().get("Host").map(|v| v.as_bytes()),
+            Some(&b"www.googleapis.com"[..])
+        );
+    }
 }
