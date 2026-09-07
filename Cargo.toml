@@ -23,7 +23,6 @@ repository = "https://github.com/libid-org/libid-rs"
 libid-crypto = { path = "crates/libid-crypto", version = "0.3.0" }
 libid-signer = { path = "crates/libid-signer", version = "0.3.0" }
 libid-transcript = { path = "crates/libid-transcript", version = "0.3.0" }
-libid-attestations = { path = "crates/libid-attestations", version = "0.3.0" }
 libid-ceremony = { path = "crates/libid-ceremony", version = "0.3.0" }
 
 alloy = { version = "1", default-features = false }

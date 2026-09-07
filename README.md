@@ -11,7 +11,6 @@ digests the libID on-chain verifiers check.
 | --- | --- | --- |
 | `libid-crypto` | yes | Contract-agnostic primitives: keccak256, EIP-191 sign/recover (27/28 `v`, low-s), OpenZeppelin-compatible sorted-pair keccak Merkle tree (root, inclusion proofs, verify, double-hashed prefixed leaves), Ethereum address and hex-key helpers. Minimal deps: `k256`, `tiny-keccak`, `hex`. |
 | `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, JSON field and `"key":"value"` snippet ranges, bare-number id snippets, anchored lookups, notary reveal ranges); the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `EvmProof` / `NotaryResponse` / `TlsHandshakeData` types. |
-| `libid-attestations` | yes | Contract-ABI-shaped digest builders, byte-pinned against the Solidity verifiers: chain-bound notary digest, JWKS-rotation notary digest (legacy 6-slot), backend digest, identity hash, and the XZkVerifier token/me attestation digests with their op-tags. |
 | `libid-signer` | yes | `ManagedSigner` — one signing identity over a local hex key or an AWS KMS key: EIP-191 claim signing (byte-compatible with `libid_crypto::sign_eth_claim`), bare prehash signing (the tlsn `Secp256k1Eth` format), alloy transaction wallets, public-key accessors, and `SignerSource::from_spec` shape-classified key-spec parsing (64-hex → local key, anything else → KMS). |
 | `libid-tlsn` | **no — git only** | The MPC-TLS session driver over the upstream `tlsn` crate: `prover` / `prover_generic` / `verifier` over any async socket, TLS 1.2 handshake-data extraction, WebPKI root store. |
 
@@ -46,7 +45,7 @@ answers over the same socket:
 ```rust,ignore
 let result = libid_tlsn::verifier(socket).await?;
 // inspect result.partial_transcript / result.tls_transcript, build an
-// EvmProof with libid_crypto merkle + libid_attestations digests, sign it
+// EvmProof with libid_crypto merkle digests, sign it
 // with libid_signer::ManagedSigner, then:
 libid_transcript::write_msg(&mut result.recovered_io, &response).await?;
 ```

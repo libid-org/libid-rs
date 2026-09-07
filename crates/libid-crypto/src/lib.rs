@@ -3,8 +3,8 @@
 //! Everything here is generic Ethereum-flavoured cryptography: keccak256,
 //! EIP-191 signing/recovery, a sorted-pair keccak Merkle tree byte-compatible
 //! with OpenZeppelin's `MerkleProof`, and address helpers. Nothing in this
-//! crate knows about any specific contract ABI — the contract-shaped digest
-//! builders live in `libid-attestations`.
+//! crate knows about any specific contract ABI — the byte layouts a Solidity
+//! decoder has to agree with live in `libid-ceremony`.
 
 use k256::ecdsa::{
     signature::hazmat::PrehashSigner,
