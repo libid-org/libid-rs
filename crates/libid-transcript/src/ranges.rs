@@ -200,38 +200,43 @@ pub fn compute_field_reveal_range(recv: &[u8], field_name: &str) -> Option<Range
     Some(start..end)
 }
 
-/// Find the byte range of a full JSON key-value snippet: `"key":"value"`.
+/// The `"key":"value"` member, from the key's opening quote through the
+/// value's closing quote.
 ///
-/// Unlike [`find_json_field_range`] which returns only the value bytes,
-/// this returns the range from the opening `"` of the key to the closing
-/// `"` of the value (inclusive).
+/// Unlike [`find_json_field_range`], which returns only the value bytes, this
+/// returns the whole member -- the range a reveal layout selects.
+///
+/// # The template is the reader's
+///
+/// `CeremonyFields.tryJsonString` matches the literal `"<name>":"`, so this
+/// matches the same bytes. Anything looser picks a range the reader cannot
+/// read: a body written `"login" : "octocat"` would be revealed here and then
+/// met with `FieldNotFound` on chain, which is the same refusal reported where
+/// nobody can see why. Failing here fails it where the reason is visible.
+///
+/// Uniqueness is NOT checked here, and that is deliberate. The reader refuses
+/// a delimiter matching twice in the bytes it was shown (REQ-COMMON-19A), and
+/// which bytes those are is exactly what a layout decides -- so
+/// `identity_response` reveals one member and commits the other, and the
+/// reader sees one. Refusing a second occurrence here would only stop an
+/// honest prover from building that layout; a dishonest one does not run this
+/// code at all.
 pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
-    let needle = format!("\"{}\"", field);
-    let pos = body
-        .windows(needle.len())
-        .position(|w| w == needle.as_bytes())?;
-    // pos points to the opening `"` of the key.
-    // Now find the closing `"` of the value (same logic as find_json_field_range).
-    let after_key = pos.checked_add(needle.len())?;
-    let colon = body
-        .get(after_key..)?
-        .iter()
-        .position(|&b| b == b':')?
-        .checked_add(after_key)?;
-    let after_colon = colon.checked_add(1)?;
-    let open_quote = body
-        .get(after_colon..)?
+    let needle = format!("\"{field}\":\"");
+    let start = find_first(body, needle.as_bytes())?;
+    let value = start.checked_add(needle.len())?;
+    let close = body
+        .get(value..)?
         .iter()
         .position(|&b| b == b'"')?
-        .checked_add(after_colon)?;
-    let after_open = open_quote.checked_add(1)?;
-    let close_quote = body
-        .get(after_open..)?
-        .iter()
-        .position(|&b| b == b'"')?
-        .checked_add(after_open)?;
-    // Range: from opening `"` of key to after the closing `"` of value.
-    Some(pos..close_quote.checked_add(1)?)
+        .checked_add(value)?;
+    // From the opening `"` of the key through the closing `"` of the value.
+    Some(start..close.checked_add(1)?)
+}
+
+/// The first occurrence of `needle`, or nothing.
+fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Find the byte range of a bare (unquoted) JSON number snippet:
@@ -242,26 +247,19 @@ pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>>
 /// number; both terminators are included in the range (on-chain `_extractId`
 /// scans digits and stops at either).
 pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
-    let needle = format!("\"{}\"", field);
-    let pos = body
-        .windows(needle.len())
-        .position(|w| w == needle.as_bytes())?;
-    // pos points to the opening `"` of the key.
-    let after_key = pos.checked_add(needle.len())?;
-    let colon = body
-        .get(after_key..)?
-        .iter()
-        .position(|&b| b == b':')?
-        .checked_add(after_key)?;
-    let after_colon = colon.checked_add(1)?;
+    let needle = format!("\"{field}\":");
+    let start = find_first(body, needle.as_bytes())?;
+    let digits = start.checked_add(needle.len())?;
     // Bound the number by the first `,` or `}` after the colon.
     let term = body
-        .get(after_colon..)?
+        .get(digits..)?
         .iter()
         .position(|&b| b == b',' || b == b'}')?
-        .checked_add(after_colon)?;
-    // Include trailing terminator (`,` or `}`); on-chain _extractId stops at either.
-    Some(pos..term.checked_add(1)?)
+        .checked_add(digits)?;
+    // The terminator is revealed with the digits: it is what proves they are
+    // the whole number rather than a prefix of a longer one, and
+    // `CeremonyFields.tryJsonInteger` refuses any other byte there.
+    Some(start..term.checked_add(1)?)
 }
 
 /// Like [`compute_field_reveal_range`] but returns the range covering the
@@ -465,6 +463,41 @@ mod tests {
     }
 
     #[test]
+    fn a_second_member_is_left_for_the_layout_to_commit() {
+        // Not refused here: the reader's uniqueness rule is over the bytes it
+        // was shown, and the layout is what decides those. `identity_response`
+        // reveals this one and commits the rest, so the reader sees one.
+        let body = br#"{"login":"octocat","user":{"login":"impostor"}}"#;
+        let range = find_json_snippet_range(body, "login").unwrap();
+        assert_eq!(&body[range], br#""login":"octocat""#);
+
+        let bare = br#"{"id":1,"user":{"id":2}}"#;
+        let range = find_json_bare_snippet_range(bare, "id").unwrap();
+        assert_eq!(&bare[range], br#""id":1,"#);
+    }
+
+    #[test]
+    fn a_spaced_member_is_refused_because_the_reader_refuses_it() {
+        // The on-chain needle is the literal `"login":"`. Selecting a range
+        // here that the reader cannot read only moves the same refusal to
+        // where its reason is invisible.
+        let body = br#"{"login" : "octocat"}"#;
+        assert!(find_json_snippet_range(body, "login").is_none());
+
+        let bare = br#"{"id" : 123}"#;
+        assert!(find_json_bare_snippet_range(bare, "id").is_none());
+    }
+
+    #[test]
+    fn a_lookalike_key_does_not_match() {
+        // `"node_id":` contains `id":` but not `"id":` -- the full delimiter is
+        // what keeps a neighbouring member out, on both sides.
+        let body = br#"{"node_id":"MDQ=","id":123}"#;
+        let range = find_json_bare_snippet_range(body, "id").unwrap();
+        assert_eq!(&body[range], br#""id":123}"#);
+    }
+
+    #[test]
     fn find_json_snippet_range_email() {
         let body = br#"{"email":"alice@example.com","verified":true}"#;
         let range = find_json_snippet_range(body, "email").unwrap();
@@ -502,7 +535,7 @@ mod tests {
     #[test]
     fn find_json_bare_snippet_range_brace_terminated() {
         // id is the last field — terminated by `}`. The snippet includes the
-        // `}`; on-chain _extractId scans digits and stops at it.
+        // `}`; `CeremonyFields.tryJsonInteger` scans digits and stops at it.
         let body = br#"{"login":"octocat","id":123}"#;
         let range = find_json_bare_snippet_range(body, "id").unwrap();
         assert_eq!(&body[range], br#""id":123}"#);
