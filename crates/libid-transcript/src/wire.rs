@@ -35,18 +35,18 @@ const MAX_MSG_SIZE: usize = 10 * 1024 * 1024;
 ///
 /// The notary places nothing here that it derived by applying a profile rule:
 /// no handle, no account identifier, no client identifier, no chain address
-/// (REQ-COMMON-61). Every one is derivable from the revealed ranges, and a
+/// (REQ-COMMON-33). Every one is derivable from the revealed ranges, and a
 /// second signed representation can disagree with the bytes it came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationWire {
-    /// The exact bytes of ceremony-common section 9.1, as the notary encoded
+    /// The exact bytes of the pinned attested-data format, as the notary encoded
     /// them. Carried whole rather than re-encoded from a decoded form: the
     /// signature is over these bytes, and a field reordered on the way through
     /// derives a key nobody trusts.
     pub attested_data: Vec<u8>,
     /// EIP-191 over `keccak256(attested_data)`. The verifying side derives the
     /// key from this pair alone and accepts no caller-supplied digest
-    /// (REQ-COMMON-49).
+    /// (REQ-COMMON-33).
     pub notary_signature: Vec<u8>,
 }
 
