@@ -402,7 +402,7 @@ where
 /// A caller hands us an absolute URI because that is where the host comes
 /// from, so left alone the request line would read
 /// `GET https://www.googleapis.com/oauth2/v3/certs HTTP/1.1` -- valid HTTP,
-/// but not the origin-form line the Platform Verifiers and `IdentityJwksRoots`
+/// but not the origin-form line the Platform Verifiers and `GoogleJwtRoots`
 /// pin, so the session would be refused on chain.
 ///
 /// Only the URI changes: the `Host` header the caller set stays as it is.

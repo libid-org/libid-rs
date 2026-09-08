@@ -28,9 +28,11 @@
 //!
 //! The same reasoning removed the last labels. The notary used to stamp a
 //! format tag, a platform id and a session tag; it observed none of them. The
-//! format is fixed by the notary key a profile pins alongside it
-//! (REQ-COMMON-18); the platform is the host it connected to; and which session
-//! this is, is the request line it recorded. All three were a party naming
+//! format is fixed by the PROFILE, which REQ-COMMON-18 also has governance
+//! select a compatible Notary Service for -- the format is not a property of
+//! the key, and a notary naming one would be naming its own selection back at
+//! the process that made it. The platform is the host it connected to, and
+//! which session this is, is the request line it recorded. All three were a party naming
 //! things it was told rather than things it saw.
 //!
 //! So this crate holds one direction of one thing:
