@@ -326,6 +326,12 @@ mod tests {
             .expect("github notarizes a token session")
     }
 
+    fn github_identity() -> IdentitySession {
+        libid_profiles::GITHUB
+            .identity
+            .expect("github notarizes an identity session")
+    }
+
     const X_TOKEN_REQ: &[u8] =
         b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
 
@@ -485,6 +491,70 @@ mod tests {
         assert_eq!(
             recv[l.reveal[1].clone()].to_vec(),
             b"\"username\":\"alice\"".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_github_identity_response_reveals_the_id_with_its_terminator() {
+        // GitHub's id is a BARE integer, so the two members are not the same
+        // shape: `login` closes on a quote, `id` closes on the structural byte
+        // after the digits. That byte is revealed WITH them, because it is what
+        // proves they are the whole number and not a prefix of a longer one --
+        // `CeremonyFields.tryJsonInteger` pins it to `,` or `}` and no other.
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"login\":\"octocat\",\"id\":583231,\"node_id\":\"MDQ=\"}";
+        let l = Layout::identity_response(recv, &github_identity()).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert_eq!(l.reveal.len(), 2);
+        assert_eq!(
+            recv[l.reveal[0].clone()].to_vec(),
+            b"\"login\":\"octocat\"".to_vec()
+        );
+        assert_eq!(
+            recv[l.reveal[1].clone()].to_vec(),
+            b"\"id\":583231,".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_github_id_closed_by_a_brace_is_revealed_the_same_way() {
+        // JSON member order is not the platform's promise, so the id can be
+        // last -- and then `}` closes it instead of `,`. The profile fixes both
+        // as acceptable; a layout that only ever produced one would refuse
+        // half of GitHub's honest responses.
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":583231}";
+        let l = Layout::identity_response(recv, &github_identity()).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert_eq!(
+            recv[l.reveal[1].clone()].to_vec(),
+            b"\"id\":583231}".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_two_profiles_do_not_read_each_other_s_responses() {
+        // The point of taking the three arguments as one profile: crossed, they
+        // describe a session nobody ran, and that used to be four arguments
+        // away. Both directions fail -- but not symmetrically, and the field
+        // each names says why.
+        let github: &[u8] =
+            b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":583231}";
+        let x: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"username\":\"alice\"}";
+
+        // X's shape wants `"id":"`, and GitHub's id is bare: it fails on the id.
+        assert_eq!(
+            Layout::identity_response(github, &x_identity()),
+            Err(LayoutError::MissingField("id".into()))
+        );
+
+        // The other way round does NOT fail on the id. GitHub's bare reader
+        // finds `"id":` and stops at the `,`, so it happily returns `"id":"7",`
+        // -- a quoted value read as though it were a number. What refuses the
+        // session is the handle: X calls it `username` and GitHub `login`.
+        // Worth knowing, because it says the id reader alone would not have
+        // caught the mismatch.
+        assert_eq!(
+            Layout::identity_response(x, &github_identity()),
+            Err(LayoutError::MissingField("login".into()))
         );
     }
 
