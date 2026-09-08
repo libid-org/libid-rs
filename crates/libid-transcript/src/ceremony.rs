@@ -459,6 +459,30 @@ mod tests {
     }
 
     #[test]
+    fn a_response_that_names_the_handle_first_still_reveals_in_offset_order() {
+        // JSON member order is not the platform's promise, and the arguments
+        // are given id-first regardless. `Layout::revealing` is what reconciles
+        // the two: `complement` walks the reveals taking each as starting where
+        // the last one ended, so an unsorted pair reads as overlap and yields a
+        // complement that tiles nothing -- a layout the Platform Verifier
+        // refuses, with no honest ceremony able to produce an accepted one.
+        //
+        // Every other fixture here happens to serialize `id` first, so this is
+        // the one that exercises the sort.
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"username\":\"alice\",\"id\":\"7\"}";
+        let l = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
+            .unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert_eq!(l.reveal.len(), 2);
+        // Offset order, which here is the OPPOSITE of the argument order.
+        assert_eq!(
+            recv[l.reveal[0].clone()].to_vec(),
+            b"\"username\":\"alice\"".to_vec()
+        );
+        assert_eq!(recv[l.reveal[1].clone()].to_vec(), b"\"id\":\"7\"".to_vec());
+    }
+
+    #[test]
     fn the_display_name_beside_a_member_stays_committed() {
         // The point of committing the rest: nothing but the two members and
         // their delimiters reaches the chain.
