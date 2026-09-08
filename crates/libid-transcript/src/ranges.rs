@@ -222,6 +222,25 @@ pub fn compute_field_reveal_range(recv: &[u8], field_name: &str) -> Option<Range
 /// honest prover from building that layout; a dishonest one does not run this
 /// code at all.
 pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
+    json_member_in(body, field).map(|member| member.member)
+}
+
+/// A `"field":"value"` member, and the value inside it.
+///
+/// Two ranges rather than one because a caller that reveals the delimiters and
+/// commits the value needs both boundaries, and deriving the inner one from the
+/// outer one means restating the template -- which is a second place to change
+/// the field name and one place to forget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonMember {
+    /// The whole member, both delimiters included.
+    pub member: Range<usize>,
+    /// The value alone, between the quotes. Empty when the value is `""`.
+    pub value: Range<usize>,
+}
+
+/// Locate the member and its value in one pass over `body`.
+fn json_member_in(body: &[u8], field: &str) -> Option<JsonMember> {
     let needle = format!("\"{field}\":\"");
     let start = find_first(body, needle.as_bytes())?;
     let value = start.checked_add(needle.len())?;
@@ -230,13 +249,33 @@ pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>>
         .iter()
         .position(|&b| b == b'"')?
         .checked_add(value)?;
-    // From the opening `"` of the key through the closing `"` of the value.
-    Some(start..close.checked_add(1)?)
+    Some(JsonMember {
+        // From the opening `"` of the key through the closing `"` of the value.
+        member: start..close.checked_add(1)?,
+        value: value..close,
+    })
 }
 
 /// The first occurrence of `needle`, or nothing.
 fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The raw bytes are the member, and not the member with framing through it.
+///
+/// A chunked body carries `\r\n<size>\r\n` between chunks, and that framing
+/// holds no quote, comma or brace -- so a member split across a boundary is
+/// found in the decoded body AND in the raw one, and the raw range silently
+/// spans the framing. What that range selects is not the member: revealed, it
+/// puts framing inside the handle a verifier reads; committed, it puts framing
+/// inside the bearer a circuit opens against the clean value the caller was
+/// handed. Re-framing cannot repair it, because a commitment covers one
+/// contiguous run and this member is two.
+///
+/// So the session is refused here, where the reason is a decodable body rather
+/// than an unopenable commitment three components later.
+fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
+    (raw == decoded).then_some(())
 }
 
 /// Find the byte range of a bare (unquoted) JSON number snippet:
@@ -271,19 +310,33 @@ pub fn compute_field_snippet_range(
     recv: &[u8],
     field_name: &str,
 ) -> Option<Range<usize>> {
+    compute_json_member(recv, field_name).map(|found| found.member)
+}
+
+/// [`compute_field_snippet_range`], keeping the value boundary too.
+///
+/// For a caller that reveals a member's delimiters and commits what sits
+/// between them: the boundaries come from the scan that found them, so no
+/// caller restates the template to recover one.
+pub fn compute_json_member(recv: &[u8], field_name: &str) -> Option<JsonMember> {
     let body_range = find_response_body_range(recv)?;
     let raw_body = &recv[body_range.clone()];
     let decoded_body = extract_response_body(recv).ok()?;
 
-    // Validate field exists in decoded body
-    let _decoded = find_json_snippet_range(&decoded_body, field_name)?;
+    // Found in both: the decoded body says the member exists, the raw body says
+    // where it sits, and the two must hold the same bytes.
+    let decoded = json_member_in(&decoded_body, field_name)?;
+    let raw = json_member_in(raw_body, field_name)?;
+    require_contiguous(
+        raw_body.get(raw.member.clone())?,
+        decoded_body.get(decoded.member)?,
+    )?;
 
-    // Find in raw body (may include chunk framing)
-    let raw_snippet_range = find_json_snippet_range(raw_body, field_name)?;
-
-    let start = body_range.start.checked_add(raw_snippet_range.start)?;
-    let end = body_range.start.checked_add(raw_snippet_range.end)?;
-    Some(start..end)
+    let at = |offset: usize| body_range.start.checked_add(offset);
+    Some(JsonMember {
+        member: at(raw.member.start)?..at(raw.member.end)?,
+        value: at(raw.value.start)?..at(raw.value.end)?,
+    })
 }
 
 /// Like [`compute_id_snippet_range`] but only matches `field_name` after the
@@ -304,22 +357,23 @@ pub fn compute_id_snippet_range_after(
 
     // Validate the anchored id against the DECODED body (chunk-framing stripped),
     // so a body that is chunked or contains decoy bytes can't drive the result.
-    {
-        let decoded = extract_response_body(recv).ok()?;
+    // The bytes it finds are kept, to be compared with the raw ones below.
+    let decoded = extract_response_body(recv).ok()?;
+    let decoded_member = {
         let danchor = decoded
             .windows(anchor_needle.len())
             .position(|w| w == anchor_needle.as_bytes())?;
-        let dsub = decoded.get(danchor.checked_add(anchor_needle.len())?..)?;
-        if quoted {
-            find_json_snippet_range(dsub, field_name)?;
+        let from = danchor.checked_add(anchor_needle.len())?;
+        let dsub = decoded.get(from..)?;
+        let rel = if quoted {
+            find_json_snippet_range(dsub, field_name)?
         } else {
-            find_json_bare_snippet_range(dsub, field_name)?;
-        }
-    }
+            find_json_bare_snippet_range(dsub, field_name)?
+        };
+        dsub.get(rel)?
+    };
 
-    // The Merkle leaf is over the RAW transcript, so map the range there. (A
-    // snippet split across a chunk boundary won't be found contiguously here and
-    // fails closed — never mis-resolves.)
+    // The Merkle leaf is over the RAW transcript, so map the range there.
     let anchor_pos = raw_body
         .windows(anchor_needle.len())
         .position(|w| w == anchor_needle.as_bytes())?;
@@ -331,6 +385,8 @@ pub fn compute_id_snippet_range_after(
     } else {
         find_json_bare_snippet_range(sub, field_name)?
     };
+    require_contiguous(sub.get(rel.clone())?, decoded_member)?;
+
     let base = body_range.start.checked_add(search_from)?;
     Some(base.checked_add(rel.start)?..base.checked_add(rel.end)?)
 }
@@ -352,9 +408,12 @@ pub fn compute_id_snippet_range(
     let raw_body = &recv[body_range.clone()];
     let decoded_body = extract_response_body(recv).ok()?;
 
-    // Validate the snippet exists in the decoded body.
-    let _decoded = find_json_bare_snippet_range(&decoded_body, field_name)?;
+    let decoded_range = find_json_bare_snippet_range(&decoded_body, field_name)?;
     let raw_snippet_range = find_json_bare_snippet_range(raw_body, field_name)?;
+    require_contiguous(
+        raw_body.get(raw_snippet_range.clone())?,
+        decoded_body.get(decoded_range)?,
+    )?;
 
     let start = body_range.start.checked_add(raw_snippet_range.start)?;
     let end = body_range.start.checked_add(raw_snippet_range.end)?;
@@ -513,6 +572,112 @@ mod tests {
 
         let range = compute_field_snippet_range(recv, "body").unwrap();
         assert_eq!(&recv[range], br#""body":"hello world""#);
+    }
+
+    /// A chunked response whose `field` value is cut in half by a chunk
+    /// boundary. The framing carries no quote, comma or brace, so every scan
+    /// here runs straight through it.
+    fn straddling(head: &str, tail: &str) -> Vec<u8> {
+        let mut out = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [head, tail] {
+            out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            out.extend_from_slice(part.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// The property every caller of `compute_json_member` depends on: the
+    /// value sits inside the member, and what the member holds either side of
+    /// it is exactly the two delimiters. A boundary that drifts breaks this
+    /// before it reaches a layout, where the symptom is a committed bearer with
+    /// a quote in it.
+    fn assert_brackets(recv: &[u8], found: &JsonMember, field: &str, value: &[u8]) {
+        assert!(
+            found.member.start <= found.value.start
+                && found.value.end <= found.member.end,
+            "the value must sit inside the member"
+        );
+        assert_eq!(&recv[found.value.clone()], value, "value bytes");
+        assert_eq!(
+            &recv[found.member.start..found.value.start],
+            format!("\"{field}\":\"").as_bytes(),
+            "opening delimiter"
+        );
+        assert_eq!(
+            &recv[found.value.end..found.member.end],
+            b"\"",
+            "closing quote"
+        );
+    }
+
+    #[test]
+    fn the_member_brackets_its_value_with_the_two_delimiters() {
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"ghu_ABC\",\"x\":1}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert_brackets(recv, &found, "access_token", b"ghu_ABC");
+    }
+
+    #[test]
+    fn a_value_carrying_structural_bytes_still_ends_at_its_quote() {
+        // Only `"` closes a JSON string, so a value holding `:`, `,` or `}`
+        // must not shorten the member -- a scan that stopped at one would
+        // commit a prefix of the bearer and reveal the rest of it.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"a:b,c}d\",\"x\":1}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert_brackets(recv, &found, "access_token", b"a:b,c}d");
+    }
+
+    #[test]
+    fn an_empty_value_is_found_with_an_empty_range() {
+        // Found, not refused: whether an empty value is usable is the caller's
+        // rule, and `token_response` has its own reason to refuse one.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"\"}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert!(found.value.is_empty());
+        assert_eq!(&recv[found.member.clone()], b"\"access_token\":\"\"");
+    }
+
+    #[test]
+    fn the_member_range_is_the_snippet_range() {
+        // `compute_field_snippet_range` is this with the value dropped, and the
+        // two must not drift apart.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":1}";
+        assert_eq!(
+            compute_json_member(recv, "login").unwrap().member,
+            compute_field_snippet_range(recv, "login").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_member_split_by_chunk_framing_is_refused() {
+        // Found in both bodies, and the raw range spans `\r\n<size>\r\n` in the
+        // middle of the value. Revealed it would put framing inside the handle
+        // a verifier reads; committed, inside the bearer a circuit opens.
+        let recv = straddling(r#"{"login":"oct"#, r#"ocat","id":1}"#);
+        assert!(compute_field_snippet_range(&recv, "login").is_none());
+    }
+
+    #[test]
+    fn a_bare_id_split_by_chunk_framing_is_refused() {
+        let recv = straddling(r#"{"login":"octocat","id":12"#, r#"34,"x":1}"#);
+        assert!(compute_id_snippet_range(&recv, "id", false).is_none());
+    }
+
+    #[test]
+    fn an_anchored_id_split_by_chunk_framing_is_refused() {
+        let recv = straddling(r#"{"user":{"id":"12"#, r#"34"}}"#);
+        assert!(compute_id_snippet_range_after(&recv, "id", true, "user").is_none());
+    }
+
+    #[test]
+    fn a_chunked_member_inside_one_chunk_still_resolves() {
+        // The point is contiguity, not chunking: a body that happens to be
+        // chunked is fine as long as the member sits in one piece.
+        let recv = straddling(r#"{"login":"octocat","#, r#""id":1}"#);
+        let range = compute_field_snippet_range(&recv, "login").unwrap();
+        assert_eq!(&recv[range], br#""login":"octocat""#);
     }
 
     #[test]

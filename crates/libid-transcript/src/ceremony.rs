@@ -22,6 +22,7 @@ use std::ops::Range;
 use crate::ranges::{
     compute_field_snippet_range,
     compute_id_snippet_range,
+    compute_json_member,
 };
 
 /// What one direction of one session discloses.
@@ -120,20 +121,39 @@ pub fn token_request(
 /// committed range is indistinguishable from a `refresh_token` value, or any
 /// other substring the prover chose to commit (REQ-PLAT-57, REQ-PLAT-58).
 pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
-    const ANCHOR: &[u8] = b"\"access_token\":\"";
-    let anchor_start = recv
-        .windows(ANCHOR.len())
-        .position(|w| w == ANCHOR)
-        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
-    let value_start = anchor_start + ANCHOR.len();
-    let value_end = value_start
-        + recv[value_start..]
-            .iter()
-            .position(|&b| b == b'"')
-            .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
+    // Named once, and a constant rather than a parameter. `access_token` is
+    // RFC 6749 section 5.1, not a platform's choice -- which is why the
+    // contract pins `ACCESS_TOKEN_PREFIX` on `TlsNotaryVerifierBase`, shared by
+    // every profile, while the things that ARE platform choices are per-profile
+    // virtuals there and parameters here: the committed body credential of
+    // `token_request`, the field names of `identity_response`.
+    const FIELD: &str = "access_token";
+    let missing = || LayoutError::MissingField(FIELD.into());
+
+    // Through the shared reader rather than a scan of its own. That one locates
+    // the response BODY, so a header carrying this delimiter cannot answer
+    // first, and it refuses a member that chunk framing runs through -- which
+    // this direction cares about most, because the framing would land inside
+    // the committed bearer and the circuit would open a value the token service
+    // never returned.
+    let found = compute_json_member(recv, FIELD).ok_or_else(missing)?;
+
+    // Reveal the two delimiters and let the complement commit the bearer
+    // between them. Both boundaries come from the scan that found the member,
+    // so nothing here restates `"access_token":"` to recompute one.
+    //
+    // An empty bearer is refused: it would leave the two reveals adjacent and
+    // commit nothing, and a response direction with no commitment is one the
+    // framing check on chain finds no bearer in.
+    if found.value.is_empty() {
+        return Err(missing());
+    }
 
     Ok(layout(
-        vec![anchor_start..value_start, value_end..value_end + 1],
+        vec![
+            found.member.start..found.value.start,
+            found.value.end..found.member.end,
+        ],
         recv.len(),
     ))
 }
@@ -245,6 +265,79 @@ mod tests {
 
     const X_TOKEN_REQ: &[u8] =
         b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
+
+    #[test]
+    fn a_bearer_split_by_chunk_framing_is_refused() {
+        // The session Rust actually runs. Framing inside the committed range
+        // means the circuit opens bytes the token service never returned, and
+        // the on-chain framing check passes anyway because it reads the
+        // delimiters either side of the commitment, not its contents.
+        let mut recv = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [
+            r#"{"access_token":"ghu_AA"#,
+            r#"BB","token_type":"bearer"}"#,
+        ] {
+            recv.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            recv.extend_from_slice(part.as_bytes());
+            recv.extend_from_slice(b"\r\n");
+        }
+        recv.extend_from_slice(b"0\r\n\r\n");
+        assert!(token_response(&recv).is_err());
+    }
+
+    #[test]
+    fn an_empty_bearer_is_refused() {
+        // The two reveals would be adjacent, the complement would commit
+        // nothing, and `requireFramedCommitment` would find no bearer in a
+        // direction that carries no commitment at all.
+        let recv: &[u8] = br#"HTTP/1.1 200 OK"#;
+        let recv = [recv, b"\r\n\r\n", br#"{"access_token":""}"#].concat();
+        assert!(token_response(&recv).is_err());
+    }
+
+    #[test]
+    fn a_bearer_carrying_structural_bytes_is_committed_whole() {
+        // Only `"` closes the value. A scan stopping at `:` or `,` would
+        // commit a prefix and REVEAL the rest of the bearer.
+        let recv = [
+            b"HTTP/1.1 200 OK\r\n\r\n".as_slice(),
+            br#"{"access_token":"gh:u,A}BC","token_type":"bearer"}"#,
+        ]
+        .concat();
+        let l = token_response(&recv).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert!(l.commit.iter().any(|c| recv[c.clone()] == *b"gh:u,A}BC"));
+        // And no revealed run holds any part of it.
+        for r in &l.reveal {
+            assert!(
+                !recv[r.clone()].windows(3).any(|w| w == b"gh:"),
+                "the bearer must not appear in a revealed range"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_cannot_answer_for_the_body() {
+        // The old scan started at byte zero, so a response header carrying the
+        // delimiter was matched before the body's own member.
+        let recv: &[u8] = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            r#"x-echo: "access_token":"decoy""#,
+            "\r\n\r\n",
+            r#"{"access_token":"real"}"#,
+        )
+        .as_bytes();
+        let l = token_response(recv).unwrap();
+        let revealed: Vec<u8> = l
+            .reveal
+            .iter()
+            .flat_map(|r| recv[r.clone()].to_vec())
+            .collect();
+        assert_eq!(revealed, br#""access_token":"""#.to_vec());
+        // The committed run is the bearer in the BODY, not the decoy.
+        let committed = l.commit.iter().find(|r| r.len() == 4).unwrap();
+        assert_eq!(&recv[committed.clone()], b"real");
+    }
 
     #[test]
     fn the_x_token_request_is_revealed_whole() {
