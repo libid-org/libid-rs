@@ -114,9 +114,11 @@ pub struct ObservedDirection<'a> {
 
 /// Building a `libid-ceremony` record out of what this crate observed.
 ///
-/// A trait, because both records belong to `libid-ceremony` and that crate is
-/// published to crates.io and must never name a tlsn type -- so an inherent
-/// `impl` for either cannot live here. A LOCAL trait can, and may be
+/// A trait, because both records belong to `libid-ceremony`, which is on the
+/// release job's publish list and so must never name a tlsn type -- `tlsn` is
+/// an unpublished git dependency, and a crate that names it cannot go to
+/// crates.io at all. That is what keeps an inherent `impl` for either record
+/// out of this crate. A LOCAL trait can, and may be
 /// implemented for any type at all, so each constructor lands on the type it
 /// constructs and every call site names what is being built before it names
 /// what it is built from.
