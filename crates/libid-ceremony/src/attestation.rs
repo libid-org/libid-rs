@@ -77,16 +77,6 @@ pub struct AttestedData {
 /// two transcript lengths.
 pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
-/// Hash the canonical authority bytes into `authorityId` (REQ-COMMON-21,
-/// REQ-COMMON-21A).
-///
-/// The record's one remaining 32-byte tag. It used to serve three more --
-/// format, platform and session -- and those went with the fields the notary
-/// was handed rather than saw.
-pub fn tag(namespaced: &str) -> [u8; 32] {
-    keccak256(namespaced.as_bytes())
-}
-
 /// Big-endian, fixed-width, no varints: the decoder is Solidity, which has no
 /// use for a compact integer that costs a branch to read.
 ///
@@ -102,6 +92,30 @@ const WIRE: bincode::config::Configuration<
     .with_fixed_int_encoding();
 
 impl AttestedData {
+    /// The `authority_id` of a record covering a session with `server_name`:
+    /// keccak256 over the canonical authority bytes (REQ-COMMON-21,
+    /// REQ-COMMON-21A).
+    ///
+    /// An associated function on the record rather than a free `tag`, because
+    /// the free form said nothing about what may be hashed. The one input this
+    /// field accepts is the TLS server name the notary AUTHENTICATED. A `Host`
+    /// header the prover composed hashes just as well and yields a record
+    /// naming an authority nobody observed -- and that substitution is one the
+    /// transcript cannot rule out, since the request carries the authority only
+    /// where the prover wrote it. Naming the record puts the rule beside the
+    /// field.
+    ///
+    /// A string rather than a server-name type: this crate is published and
+    /// knows nothing about how a TLS library models a name, which is also what
+    /// keeps this mapping testable without a session.
+    ///
+    /// The record's one remaining 32-byte tag. It used to serve three more --
+    /// format, platform and session -- and those went with the fields the
+    /// notary was handed rather than saw.
+    pub fn authority_id_of(server_name: &str) -> [u8; 32] {
+        keccak256(server_name.as_bytes())
+    }
+
     /// Lay the record out. This does NOT judge it: a malformed record is the
     /// prover's problem, the Platform Verifier's decision, and the client's to
     /// catch in a dry run. Refusing to sign here would only withhold a session
@@ -128,7 +142,7 @@ mod tests {
         // Shaped like the X identity session: the request reveals everything
         // but the bearer, which is committed and framed by the header bytes.
         AttestedData {
-            authority_id: tag("api.x.com"),
+            authority_id: AttestedData::authority_id_of("api.x.com"),
             created_at: 1_770_000_000,
             sent_transcript_length: 60,
             recv_transcript_length: 40,

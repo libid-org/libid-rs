@@ -11,7 +11,6 @@
 //! rule it keeps in full.
 
 use libid_ceremony::attestation::{
-    tag,
     AttestedData,
     DirectionBlock,
     RangeCommitment,
@@ -127,7 +126,9 @@ impl ObservedSession<'_> {
         Ok(AttestedData {
             // The canonical authority of section 9: the lowercase ASCII TLS
             // server name the notary authenticated, with no trailing dot.
-            authority_id: tag(&self.authority.to_ascii_lowercase()),
+            authority_id: AttestedData::authority_id_of(
+                &self.authority.to_ascii_lowercase(),
+            ),
             created_at: self.created_at,
             sent_transcript_length: u32_of(self.transcript.len_sent())?,
             recv_transcript_length: u32_of(self.transcript.len_received())?,
@@ -346,9 +347,15 @@ mod tests {
     fn authority_is_the_authenticated_server_name() {
         let (partial, commitments) = session();
         let data = observed(&partial, &commitments).attested_data().unwrap();
-        assert_eq!(data.authority_id, tag("api.x.com"));
+        assert_eq!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.x.com")
+        );
         // And it is NOT taken from a Host header the prover composed.
-        assert_ne!(data.authority_id, tag("evil.example"));
+        assert_ne!(
+            data.authority_id,
+            AttestedData::authority_id_of("evil.example")
+        );
     }
 
     #[test]
