@@ -22,7 +22,7 @@ use std::ops::Range;
 use crate::ranges::{
     compute_field_snippet_range,
     compute_id_snippet_range,
-    compute_json_member,
+    JsonMember,
 };
 
 /// What one direction of one session discloses.
@@ -167,7 +167,7 @@ impl Layout {
         // this direction cares about most, because the framing would land inside
         // the committed bearer and the circuit would open a value the token service
         // never returned.
-        let found = compute_json_member(recv, FIELD).ok_or_else(missing)?;
+        let found = JsonMember::in_response(recv, FIELD).ok_or_else(missing)?;
 
         // Reveal the two delimiters and let the complement commit the bearer
         // between them. Both boundaries come from the scan that found the member,

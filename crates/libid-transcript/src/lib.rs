@@ -24,7 +24,6 @@ pub use ranges::{
     compute_field_snippet_range,
     compute_id_snippet_range,
     compute_id_snippet_range_after,
-    compute_json_member,
     extract_header,
     extract_response_body,
     find_header_range,
