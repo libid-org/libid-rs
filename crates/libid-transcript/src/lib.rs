@@ -16,27 +16,20 @@
 
 pub mod ceremony;
 pub mod ranges;
-pub mod types;
 pub mod wire;
 
 pub use ranges::{
-    compute_field_reveal_range,
     compute_field_snippet_range,
     compute_id_snippet_range,
-    compute_id_snippet_range_after,
     extract_header,
     extract_response_body,
     find_header_range,
     find_json_bare_snippet_range,
-    find_json_field_range,
     find_json_snippet_range,
-    find_notary_reveal_ranges,
-    find_presentation_commit_ranges,
     find_request_line_range,
     find_response_body_range,
     JsonMember,
 };
-pub use types::TlsHandshakeData;
 pub use wire::{
     read_msg,
     write_msg,

@@ -26,8 +26,6 @@ use tlsn::{
         verifier::VerifierConfig,
     },
     connection::{
-        CertBinding,
-        CertBindingV1_2,
         HandshakeData,
         ServerName,
     },
@@ -69,12 +67,6 @@ use tokio_util::compat::{
 use tracing::{
     info,
     instrument,
-};
-
-use libid_transcript::{
-    find_notary_reveal_ranges,
-    find_presentation_commit_ranges,
-    TlsHandshakeData,
 };
 
 use crate::{
@@ -151,28 +143,6 @@ pub fn root_store() -> RootCertStore {
     }
 }
 
-/// Extract TLS handshake data from a TLS transcript.
-pub fn extract_handshake_data(
-    tls_transcript: &TlsTranscript,
-) -> Result<TlsHandshakeData> {
-    let CertBinding::V1_2(CertBindingV1_2 {
-        client_random,
-        server_random,
-        server_ephemeral_key,
-    }) = tls_transcript.certificate_binding()
-    else {
-        return Err(Error::UnsupportedTlsVersion {
-            detail: "expected TLS 1.2".into(),
-        });
-    };
-
-    Ok(TlsHandshakeData {
-        client_random: *client_random,
-        server_random: *server_random,
-        server_ephemeral_key: server_ephemeral_key.key.clone(),
-    })
-}
-
 /// A phase boundary of a prover session, in the order they occur.
 ///
 /// Reported through `on_progress` so a caller can drive something typed off
@@ -235,8 +205,6 @@ pub struct ProverResult<T> {
     pub response_body: Vec<u8>,
     /// The TLS secrets for proof construction.
     pub secrets: Secrets,
-    /// Extracted TLS handshake data.
-    pub handshake: TlsHandshakeData,
     /// One opening per commitment this session made, in the order the layouts
     /// stated them. Empty when the session committed nothing.
     pub commitment_openings: Vec<CommitmentOpening>,
@@ -256,100 +224,6 @@ pub struct VerifierResult<T> {
     pub transcript_commitments: Vec<TranscriptCommitment>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
-}
-
-/// Parameters for the user-info prover flow ([`prover`]).
-#[derive(Debug, Clone, Copy)]
-pub struct UserInfoParams<'a> {
-    /// API host (SNI and Host header).
-    pub api_host: &'a str,
-    /// Path of the user-info endpoint, e.g. `"/2/users/me"`.
-    pub user_info_path: &'a str,
-    /// JSON field holding the handle; its `"field":"value"` snippet is
-    /// revealed.
-    pub username_field: &'a str,
-    /// Optional immutable-id field: `(field_name, quoted)`. Quoted (X):
-    /// `"id":"<id>"`; bare (GitHub): `"id":<n>,`. Revealed when present so
-    /// the backend can build idPath.
-    pub id_field: Option<(&'a str, bool)>,
-    /// User-Agent header value.
-    pub user_agent: &'a str,
-}
-
-/// Run the MPC-TLS prover to fetch user data from a platform API, revealing
-/// the username snippet (and the id snippet when configured).
-#[instrument(skip_all, fields(api_host = params.api_host))]
-pub async fn prover<T>(
-    socket: T,
-    access_token: &str,
-    params: &UserInfoParams<'_>,
-) -> Result<ProverResult<T>>
-where
-    T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
-{
-    let username_field = params.username_field;
-    let id_field = params.id_field;
-    // The headers this flow sends, stated here rather than injected by the
-    // library. A notarized request is bytes a verifier compares against a
-    // profile, so whoever knows the profile writes them.
-    let request = hyper::Request::builder()
-        .method("GET")
-        .uri(format!(
-            "https://{}{}",
-            params.api_host, params.user_info_path
-        ))
-        .header("Host", params.api_host)
-        .header("Connection", "close")
-        .header("Accept", "application/json")
-        .header("User-Agent", params.user_agent)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .body(http_body_util::Full::new(Bytes::new()))
-        .map_err(|e| Error::MpcTlsFailed {
-            detail: format!("request build: {e}"),
-        })?;
-
-    prover_generic(
-        socket,
-        request,
-        // This flow predates the ceremony layouts and still selects the old
-        // sparse ranges: the request line and `Host` revealed, everything else
-        // of the response committed whole. It does NOT tile, so what it
-        // produces is not a ceremony attestation. It goes at cutover.
-        |sent, recv| {
-            let mut ranges =
-                vec![
-                    libid_transcript::compute_field_snippet_range(recv, username_field)
-                        .ok_or_else(|| Error::MpcTlsFailed {
-                        detail: format!(
-                            "username field '{}' not found in response body",
-                            username_field
-                        ),
-                    })?,
-                ];
-            // Also reveal the immutable id snippet so the backend can build idPath.
-            // Quoted (X): `"id":"<id>"`; bare (GitHub): `"id":<n>,`.
-            if let Some((id_field, quoted)) = id_field {
-                if let Some(range) =
-                    libid_transcript::compute_id_snippet_range(recv, id_field, quoted)
-                {
-                    ranges.push(range);
-                }
-            }
-            Ok((
-                Layout {
-                    reveal: find_notary_reveal_ranges(sent),
-                    commit: find_presentation_commit_ranges(sent),
-                },
-                Layout {
-                    reveal: ranges,
-                    commit: core::iter::once(0..recv.len()).collect(),
-                },
-            ))
-        },
-        // This flow goes at cutover and nothing watches it run.
-        |_| {},
-    )
-    .await
 }
 
 /// Rewrite the request's URI to origin-form before it goes on the wire.
@@ -612,7 +486,6 @@ where
         on_progress(ProverStep::MpcProofFinalized);
 
         let tls_transcript = prover.tls_transcript().clone();
-        let handshake = extract_handshake_data(&tls_transcript)?;
 
         let mut req_config = RequestConfig::builder();
         req_config
@@ -693,7 +566,7 @@ where
         })?;
         handle.close();
 
-        Ok((body, secrets, handshake, commitment_openings))
+        Ok((body, secrets, commitment_openings))
     };
     tokio::pin!(setup);
 
@@ -701,7 +574,7 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
-    let (body, secrets, handshake, commitment_openings) = tokio::select! {
+    let (body, secrets, commitment_openings) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
@@ -723,7 +596,6 @@ where
     Ok(ProverResult {
         response_body: body.to_vec(),
         secrets,
-        handshake,
         commitment_openings,
         recovered_io,
     })

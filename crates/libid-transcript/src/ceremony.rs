@@ -96,9 +96,8 @@ impl Layout {
     /// is a caller bug that sorting cannot repair, and the debug assertion is what
     /// says so.
     ///
-    /// Private, and `Layout`'s fields stay public beside it. Callers outside this
-    /// module state layouts this module does not know -- `libid-tlsn`'s legacy
-    /// prover builds two whose ranges deliberately do not tile -- so tiling is a
+    /// Private, and `Layout`'s fields stay public beside it. A prover outside
+    /// this module may state a layout this module does not know, so tiling is a
     /// property of these constructors and not of the type. A public constructor
     /// advertising a guarantee the type does not enforce would be worse than no
     /// public constructor at all.
