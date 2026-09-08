@@ -19,11 +19,10 @@ use libid_ceremony::attestation::{
     DirectionBlock,
 };
 use libid_tlsn::attest::{
-    attested_data,
-    AttestationInput,
+    FromObserved,
+    ObservedSession,
 };
 use libid_transcript::ceremony::{
-    self,
     IdShape,
     Layout,
 };
@@ -54,7 +53,8 @@ fn hash32(byte: u8) -> TypedHash {
     }
 }
 
-/// Turn a pair of layouts into what a notary's verifier hands `attested_data`.
+/// Turn a pair of layouts into the [`ObservedSession`] a notary's verifier
+/// holds.
 ///
 /// This is the step a real session performs inside MPC: the prover states what
 /// it reveals, and the verifier ends up holding the revealed transcript and a
@@ -89,12 +89,12 @@ fn record(
         }));
     }
 
-    attested_data(
-        &partial,
-        "api.x.com",
-        &commitments,
-        AttestationInput { created_at },
-    )
+    AttestedData::from_observed(ObservedSession {
+        transcript: &partial,
+        authority: "api.x.com",
+        commitments: &commitments,
+        created_at,
+    })
     .expect("the layouts produce an attestable session")
 }
 
@@ -137,8 +137,8 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 
 #[test]
 fn the_token_session_produces_a_record_the_verifier_accepts() {
-    let sl = ceremony::token_request(TOKEN_SENT, None).unwrap();
-    let rl = ceremony::token_response(TOKEN_RECV).unwrap();
+    let sl = Layout::token_request(TOKEN_SENT, None).unwrap();
+    let rl = Layout::token_response(TOKEN_RECV).unwrap();
     let data = record(TOKEN_SENT, TOKEN_RECV, &sl, &rl, 1_770_000_000);
 
     assert_tiles(&data.sent, data.sent_transcript_length, "token request");
@@ -186,8 +186,8 @@ fn the_token_session_produces_a_record_the_verifier_accepts() {
 
 #[test]
 fn the_identity_session_produces_a_record_the_verifier_accepts() {
-    let sl = ceremony::identity_request(ID_SENT).unwrap();
-    let rl = ceremony::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
+    let sl = Layout::identity_request(ID_SENT).unwrap();
+    let rl = Layout::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
         .unwrap();
     let data = record(ID_SENT, ID_RECV, &sl, &rl, 1_770_000_000);
 
@@ -255,14 +255,14 @@ fn both_sessions_encode_and_carry_their_own_lengths() {
         (
             TOKEN_SENT,
             TOKEN_RECV,
-            ceremony::token_request(TOKEN_SENT, None).unwrap(),
-            ceremony::token_response(TOKEN_RECV).unwrap(),
+            Layout::token_request(TOKEN_SENT, None).unwrap(),
+            Layout::token_response(TOKEN_RECV).unwrap(),
         ),
         (
             ID_SENT,
             ID_RECV,
-            ceremony::identity_request(ID_SENT).unwrap(),
-            ceremony::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
+            Layout::identity_request(ID_SENT).unwrap(),
+            Layout::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
                 .unwrap(),
         ),
     ] {
@@ -284,8 +284,8 @@ fn the_github_exchange_commits_a_suffix_and_nothing_else() {
     const RECV: &[u8] =
         b"HTTP/1.1 200 OK\r\n\r\n{\"token_type\":\"bearer\",\"access_token\":\"SECRETBEARER\"}";
 
-    let sl = ceremony::token_request(SENT, Some("client_secret")).unwrap();
-    let rl = ceremony::token_response(RECV).unwrap();
+    let sl = Layout::token_request(SENT, Some("client_secret")).unwrap();
+    let rl = Layout::token_response(RECV).unwrap();
     let data = record(SENT, RECV, &sl, &rl, 1_770_000_000);
 
     assert_tiles(&data.sent, data.sent_transcript_length, "github exchange");

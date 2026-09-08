@@ -11,7 +11,6 @@
 //! rule it keeps in full.
 
 use libid_ceremony::attestation::{
-    tag,
     AttestedData,
     DirectionBlock,
     RangeCommitment,
@@ -26,14 +25,55 @@ use tlsn::{
     },
 };
 
-/// What the profile pins, and what only the notary knows.
-pub struct AttestationInput {
+/// One notarized session, as the notary observed it.
+///
+/// Every field here is something the notary SAW: the transcript it helped
+/// decrypt, the server name it authenticated against WebPKI, the commitments
+/// the prover made inside the session, and the moment its own clock said the
+/// session closed. That is the line REQ-COMMON-33 draws between what a notary
+/// may sign and what it may not, and a type is how the line is kept -- a value
+/// the notary was merely TOLD has no field to arrive in, so it cannot reach the
+/// signed bytes by being appended to an argument list.
+///
+/// It borrows rather than owns. The party that ran the session already holds
+/// every one of these, and copying a whole transcript across in order to
+/// describe it would double the peak memory of a notarization to say nothing
+/// new. `Copy` for the same reason: handing the same view to two calls should
+/// not mean restating it.
+///
+/// Deliberately not `Debug`. Printing one prints the revealed transcript --
+/// the prover's request with its credential framing around it -- into whatever
+/// log line was being written at the time.
+#[derive(Clone, Copy)]
+pub struct ObservedSession<'a> {
+    /// The transcript with the prover's revealed ranges opened and the rest
+    /// still closed. Both directions and both signed lengths are read from this
+    /// one value, so there is no pair of lengths that can disagree with the
+    /// ranges they bound.
+    pub transcript: &'a PartialTranscript,
+    /// The DNS name the notary authenticated, which the caller takes from
+    /// `ServerName::Dns`.
+    ///
+    /// It arrives as a string rather than as tlsn's name type so this mapping
+    /// stays testable and so nothing here depends on how upstream models a
+    /// server name. It reaches the record as a signed field rather than as a
+    /// transcript range because the transcript carries the authority only in a
+    /// prover-composed `Host` header, which says nothing about which server
+    /// answered (REQ-COMMON-21, REQ-COMMON-21A).
+    pub authority: &'a str,
+    /// Every commitment the session produced, both directions together, in
+    /// whatever order the prover made them.
+    /// [`AttestedData::from_observed`] splits them by direction and sorts
+    /// them by offset, so a caller passes on
+    /// what it was handed rather than pre-sorting a list the format reorders
+    /// anyway.
+    pub commitments: &'a [TranscriptCommitment],
     /// The notary's OWN clock reading when the session completed.
     ///
     /// Never the prover's, never a response header, never any other party's:
     /// the verifier's freshness window is measured from this, so a reading the
-    /// observed party could choose would be a window it could choose. It is an
-    /// argument rather than a call to the clock here so a test can pin it; the
+    /// observed party could choose would be a window it could choose. It is a
+    /// field rather than a call to the clock here so a test can pin it; the
     /// caller must pass its own.
     pub created_at: u64,
 }
@@ -56,108 +96,161 @@ fn u32_of(value: usize) -> Result<u32, AttestError> {
     u32::try_from(value).map_err(|_| AttestError::OffsetTooLarge(value))
 }
 
-/// Build the attested data for one notarized session.
+/// One direction of an [`ObservedSession`], which is what a [`DirectionBlock`]
+/// is built from.
 ///
-/// The notary places nothing here that it derived by applying a profile rule --
-/// no handle, no account identifier, no client identifier, no chain address
-/// (REQ-COMMON-33). Every such value is already derivable from the revealed
-/// ranges, a second signed copy can disagree with the bytes it came from, and
-/// producing one would make the Notary Service decide something
-/// profile-specific.
-/// `authority` is the DNS name the notary authenticated, which the caller
-/// takes from `ServerName::Dns`. It arrives as a string rather than as tlsn's
-/// name type so this mapping stays testable and so nothing here depends on how
-/// upstream models a server name.
-pub fn attested_data(
-    partial: &PartialTranscript,
-    authority: &str,
-    commitments: &[TranscriptCommitment],
-    input: AttestationInput,
-) -> Result<AttestedData, AttestError> {
-    Ok(AttestedData {
-        // The canonical authority of section 9: the lowercase ASCII TLS server
-        // name the notary authenticated, with no trailing dot. It is a signed
-        // field rather than a transcript range because the transcript carries
-        // the authority only in a prover-composed `Host` header, which says
-        // nothing about which server answered (REQ-COMMON-21,
-        // REQ-COMMON-21A).
-        authority_id: tag(&authority.to_ascii_lowercase()),
-        created_at: input.created_at,
-        sent_transcript_length: u32_of(partial.len_sent())?,
-        recv_transcript_length: u32_of(partial.len_received())?,
-        sent: direction_block(partial, commitments, Direction::Sent)?,
-        received: direction_block(partial, commitments, Direction::Received)?,
-    })
+/// A pair rather than two arguments, for the reason the session is a struct
+/// rather than four: a transcript and a commitment list must come from the SAME
+/// session or the block describes bytes nobody observed together. Carrying the
+/// whole session makes that pairing unspellable-wrong rather than merely
+/// uncommon, and leaves the direction as the only thing a caller chooses.
+#[derive(Clone, Copy)]
+pub struct ObservedDirection<'a> {
+    /// The session both directions are read from.
+    pub session: ObservedSession<'a>,
+    /// Which of its two directions this block covers.
+    pub direction: Direction,
 }
 
-fn direction_block(
-    partial: &PartialTranscript,
-    commitments: &[TranscriptCommitment],
-    direction: Direction,
-) -> Result<DirectionBlock, AttestError> {
-    let (authed, data) = match direction {
-        Direction::Sent => (partial.sent_authed(), partial.sent_unsafe()),
-        Direction::Received => (partial.received_authed(), partial.received_unsafe()),
-    };
+/// Building a `libid-ceremony` record out of what this crate observed.
+///
+/// A trait, because both records belong to `libid-ceremony`, which is on the
+/// release job's publish list and so must never name a tlsn type -- `tlsn` is
+/// an unpublished git dependency, and a crate that names it cannot go to
+/// crates.io at all. That is what keeps an inherent `impl` for either record
+/// out of this crate. A LOCAL trait can, and may be
+/// implemented for any type at all, so each constructor lands on the type it
+/// constructs and every call site names what is being built before it names
+/// what it is built from.
+///
+/// Two implementors, and the pair is the layering: an [`AttestedData`] is a
+/// header plus two [`DirectionBlock`]s, and its impl below is written that way
+/// rather than inlining the direction walk twice.
+///
+/// It is not an abstraction over records and no third implementor is expected.
+/// It is the way to put a constructor where coherence would otherwise refuse
+/// one. Bring it into scope to use it, as any extension trait is brought in.
+pub trait FromObserved<Source>: Sized {
+    /// The record `source` describes, or the reason the format cannot describe
+    /// it.
+    fn from_observed(source: Source) -> Result<Self, AttestError>;
+}
 
-    // One entry per revealed range, in ascending start order, each carrying
-    // where it sat and what it held. Revealed bytes signed without their
-    // offsets say that some bytes were disclosed but not where they sat, which
-    // is not enough to tile a transcript. The end is the bytes' own length, so
-    // it is not written down twice.
-    let mut revealed = Vec::new();
-    for range in authed.iter() {
-        // Still checked, even though only `start` is encoded: a range whose end
-        // does not fit is a transcript this record cannot describe.
-        u32_of(range.end)?;
-        revealed.push(RevealedRange {
-            start: u32_of(range.start)?,
-            bytes: data[range.clone()].to_vec(),
-        });
+impl FromObserved<ObservedSession<'_>> for AttestedData {
+    /// The record of a session, laid out as ceremony-common section 9.1 fixes
+    /// it.
+    ///
+    /// The four values this reads were never four unrelated things: they are
+    /// four readings of ONE session, which a caller previously had to keep in
+    /// step by hand across an argument list.
+    ///
+    /// The notary places nothing here that it derived by applying a profile
+    /// rule -- no handle, no account identifier, no client identifier, no chain
+    /// address (REQ-COMMON-33). Every such value is already derivable from the
+    /// revealed ranges, a second signed copy can disagree with the bytes it
+    /// came from, and producing one would make the Notary Service decide
+    /// something profile-specific. What is signed is what [`ObservedSession`]
+    /// holds, in the order the record declares it.
+    ///
+    /// This fails only where the session cannot be described by the format at
+    /// all: an offset past its 32-bit field, a commitment under the wrong hash,
+    /// a commitment over disjoint ranges. It judges nothing else. Whether the
+    /// ranges tile, whether the request carries exactly one credential header
+    /// -- those are the Platform Verifier's decision and the client's dry run,
+    /// and refusing here would only withhold a session the notary really did
+    /// observe.
+    fn from_observed(session: ObservedSession<'_>) -> Result<Self, AttestError> {
+        let of = |direction| ObservedDirection { session, direction };
+        Ok(AttestedData {
+            authority_id: AttestedData::authority_id_of(session.authority),
+            created_at: session.created_at,
+            sent_transcript_length: u32_of(session.transcript.len_sent())?,
+            recv_transcript_length: u32_of(session.transcript.len_received())?,
+            sent: DirectionBlock::from_observed(of(Direction::Sent))?,
+            received: DirectionBlock::from_observed(of(Direction::Received))?,
+        })
     }
+}
 
-    let mut out = Vec::new();
-    for commitment in commitments {
-        // The enum is non-exhaustive upstream, so an unknown commitment kind
-        // is skipped rather than assumed to be a hash.
-        let TranscriptCommitment::Hash(hash) = commitment else {
-            continue;
-        };
-        if hash.direction != direction {
-            continue;
-        }
-        // The notarization library defaults to BLAKE3 while the Proving Circuit
-        // computes SHA-256, so a prover left on library defaults produces
-        // commitments the circuit cannot open (REQ-COMMON-38).
-        if hash.hash.alg != HashAlgId::SHA256 {
-            return Err(AttestError::WrongCommitmentAlgorithm(hash.hash.alg));
-        }
-
-        // A `RangeSet` may be disjoint, but the format pairs one commitment
-        // value with one offset pair. A hash over a union cannot be split
-        // between two entries without inventing a value for each.
-        let ranges: Vec<_> = hash.idx.iter().collect();
-        let [range] = ranges.as_slice() else {
-            return Err(AttestError::DisjointCommitment(ranges.len()));
+impl FromObserved<ObservedDirection<'_>> for DirectionBlock {
+    /// One direction's revealed runs and its commitments, both in ascending
+    /// start order.
+    ///
+    /// Written once and asked twice rather than written twice and compared: the
+    /// two directions differ only in which pair of accessors they read, and a
+    /// second copy of this loop is a second place for the offset arithmetic to
+    /// drift.
+    fn from_observed(source: ObservedDirection<'_>) -> Result<Self, AttestError> {
+        let (authed, data) = match source.direction {
+            Direction::Sent => (
+                source.session.transcript.sent_authed(),
+                source.session.transcript.sent_unsafe(),
+            ),
+            Direction::Received => (
+                source.session.transcript.received_authed(),
+                source.session.transcript.received_unsafe(),
+            ),
         };
 
-        let value = hash.hash.value.as_bytes();
-        let value: [u8; 32] = value
-            .try_into()
-            .map_err(|_| AttestError::BadCommitmentLength(value.len()))?;
+        // One entry per revealed range, in ascending start order, each carrying
+        // where it sat and what it held. Revealed bytes signed without their
+        // offsets say that some bytes were disclosed but not where they sat, which
+        // is not enough to tile a transcript. The end is the bytes' own length, so
+        // it is not written down twice.
+        let mut revealed = Vec::new();
+        for range in authed.iter() {
+            // Still checked, even though only `start` is encoded: a range whose end
+            // does not fit is a transcript this record cannot describe.
+            u32_of(range.end)?;
+            revealed.push(RevealedRange {
+                start: u32_of(range.start)?,
+                bytes: data[range.clone()].to_vec(),
+            });
+        }
 
-        out.push(RangeCommitment {
-            start: u32_of(range.start)?,
-            end: u32_of(range.end)?,
-            commitment: value,
-        });
+        let mut out = Vec::new();
+        for commitment in source.session.commitments {
+            // The enum is non-exhaustive upstream, so an unknown commitment kind
+            // is skipped rather than assumed to be a hash.
+            let TranscriptCommitment::Hash(hash) = commitment else {
+                continue;
+            };
+            if hash.direction != source.direction {
+                continue;
+            }
+            // The notarization library defaults to BLAKE3 while the Proving Circuit
+            // computes SHA-256, so a prover left on library defaults produces
+            // commitments the circuit cannot open (REQ-COMMON-38).
+            if hash.hash.alg != HashAlgId::SHA256 {
+                return Err(AttestError::WrongCommitmentAlgorithm(hash.hash.alg));
+            }
+
+            // A `RangeSet` may be disjoint, but the format pairs one commitment
+            // value with one offset pair. A hash over a union cannot be split
+            // between two entries without inventing a value for each.
+            let ranges: Vec<_> = hash.idx.iter().collect();
+            let [range] = ranges.as_slice() else {
+                return Err(AttestError::DisjointCommitment(ranges.len()));
+            };
+
+            let value = hash.hash.value.as_bytes();
+            let value: [u8; 32] = value
+                .try_into()
+                .map_err(|_| AttestError::BadCommitmentLength(value.len()))?;
+
+            out.push(RangeCommitment {
+                start: u32_of(range.start)?,
+                end: u32_of(range.end)?,
+                commitment: value,
+            });
+        }
+        out.sort_by_key(|c| c.start);
+
+        Ok(DirectionBlock {
+            revealed,
+            commitments: out,
+        })
     }
-    out.sort_by_key(|c| c.start);
-
-    Ok(DirectionBlock {
-        revealed,
-        commitments: out,
-    })
 }
 
 #[cfg(test)]
@@ -184,7 +277,7 @@ mod tests {
 
     use super::*;
     use libid_transcript::ceremony::{
-        self,
+        IdShape,
         Layout,
     };
     use rangeset::set::RangeSet;
@@ -200,8 +293,25 @@ mod tests {
     const SENT: &[u8] = b"GET /2/users/me HTTP/1.1\r\nauthorization: Bearer TOK\r\n\r\n";
     const RECV: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\"}";
 
-    fn input() -> AttestationInput {
-        AttestationInput {
+    /// The session as the notary saw it, for the tests that vary only the
+    /// transcript and the commitments over it.
+    fn observed<'a>(
+        transcript: &'a PartialTranscript,
+        commitments: &'a [TranscriptCommitment],
+    ) -> ObservedSession<'a> {
+        observed_at(transcript, commitments, "api.x.com")
+    }
+
+    /// The same, for the one test that varies the authority.
+    fn observed_at<'a>(
+        transcript: &'a PartialTranscript,
+        commitments: &'a [TranscriptCommitment],
+        authority: &'a str,
+    ) -> ObservedSession<'a> {
+        ObservedSession {
+            transcript,
+            authority,
+            commitments,
             created_at: 1_770_000_000,
         }
     }
@@ -235,7 +345,7 @@ mod tests {
         // These appear nowhere in any signed field today, and REQ-COMMON-36
         // makes them the only source of the length the coverage check uses.
         let (partial, commitments) = session();
-        let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_eq!(data.sent_transcript_length, SENT.len() as u32);
         assert_eq!(data.recv_transcript_length, RECV.len() as u32);
     }
@@ -243,7 +353,7 @@ mod tests {
     #[test]
     fn encodes_to_the_length_its_own_fields_imply() {
         let (partial, commitments) = session();
-        let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         let encoded = data.encode().unwrap();
 
         // No decoder here to round-trip against: decoding is the chain's and
@@ -266,17 +376,38 @@ mod tests {
         // The whole point: what the notary emits must satisfy the coverage
         // check the Platform Verifier runs, or no genuine session ever passes.
         let (partial, commitments) = session();
-        let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_tiles(&data.sent, data.sent_transcript_length);
     }
 
     #[test]
     fn authority_is_the_authenticated_server_name() {
         let (partial, commitments) = session();
-        let data = attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
-        assert_eq!(data.authority_id, tag("api.x.com"));
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
+        assert_eq!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.x.com")
+        );
         // And it is NOT taken from a Host header the prover composed.
-        assert_ne!(data.authority_id, tag("evil.example"));
+        assert_ne!(
+            data.authority_id,
+            AttestedData::authority_id_of("evil.example")
+        );
+    }
+
+    #[test]
+    fn the_authority_is_canonicalized_on_the_way_into_the_record() {
+        // The rule used to be kept here, by this call site remembering to
+        // lowercase. It now belongs to the constructor, so what this asserts is
+        // that the record still comes out canonical when the caller does not.
+        let (partial, commitments) = session();
+        let data =
+            AttestedData::from_observed(observed_at(&partial, &commitments, "API.X.com"))
+                .unwrap();
+        assert_eq!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.x.com")
+        );
     }
 
     #[test]
@@ -289,7 +420,7 @@ mod tests {
         };
         h.hash.alg = HashAlgId::BLAKE3;
         assert!(matches!(
-            attested_data(&partial, "api.x.com", &commitments, input()),
+            AttestedData::from_observed(observed(&partial, &commitments)),
             Err(AttestError::WrongCommitmentAlgorithm(_))
         ));
     }
@@ -305,7 +436,7 @@ mod tests {
             hash: hash32(7),
         })];
         assert!(matches!(
-            attested_data(&partial, "api.x.com", &commitments, input()),
+            AttestedData::from_observed(observed(&partial, &commitments)),
             Err(AttestError::DisjointCommitment(2))
         ));
     }
@@ -342,7 +473,7 @@ mod tests {
             let partial = Transcript::new(SENT, recv)
                 .to_partial(sent_revealed.clone(), RangeSet::from(0..recv.len()));
             let data =
-                attested_data(&partial, "api.x.com", &commitments, input()).unwrap();
+                AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
             headers.push(data.encode().unwrap()[..144].to_vec());
         }
         assert_eq!(
@@ -356,11 +487,11 @@ mod tests {
         let b = Transcript::new(SENT, other_recv)
             .to_partial(sent_revealed, RangeSet::from(0..other_recv.len()));
         assert_ne!(
-            attested_data(&a, "api.x.com", &commitments, input())
+            AttestedData::from_observed(observed(&a, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
-            attested_data(&b, "api.x.com", &commitments, input())
+            AttestedData::from_observed(observed(&b, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
@@ -401,7 +532,7 @@ mod tests {
                 }));
             }
         }
-        attested_data(&partial, "api.x.com", &commitments, input()).unwrap()
+        AttestedData::from_observed(observed(&partial, &commitments)).unwrap()
     }
 
     #[test]
@@ -409,14 +540,9 @@ mod tests {
         let sent: &[u8] = b"GET /2/users/me HTTP/1.1\r\nhost: api.x.com\r\nauthorization: Bearer TOKENVALUE\r\nconnection: close\r\n\r\n";
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
 
-        let s = ceremony::identity_request(sent).unwrap();
-        let r = ceremony::identity_response(
-            recv,
-            "id",
-            ceremony::IdShape::JsonString,
-            "username",
-        )
-        .unwrap();
+        let s = Layout::identity_request(sent).unwrap();
+        let r = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
+            .unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
         assert_tiles(&data.received, data.recv_transcript_length);
@@ -431,8 +557,8 @@ mod tests {
         let sent: &[u8] = b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"SECRETBEARER\"}";
 
-        let s = ceremony::token_request(sent, None).unwrap();
-        let r = ceremony::token_response(recv).unwrap();
+        let s = Layout::token_request(sent, None).unwrap();
+        let r = Layout::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
         // X reveals its token request whole, so the verifier can see the head
@@ -447,8 +573,8 @@ mod tests {
         let sent: &[u8] = b"POST /login/oauth/access_token HTTP/1.1\r\nhost: github.com\r\n\r\nclient_id=Iv1.x&code=abc&code_verifier=xyz&client_secret=deadbeef";
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"gho_SECRET\"}";
 
-        let s = ceremony::token_request(sent, Some("client_secret")).unwrap();
-        let r = ceremony::token_response(recv).unwrap();
+        let s = Layout::token_request(sent, Some("client_secret")).unwrap();
+        let r = Layout::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
         assert_eq!(data.sent.revealed.len(), 1);

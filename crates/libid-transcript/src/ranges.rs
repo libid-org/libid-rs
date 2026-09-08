@@ -222,7 +222,7 @@ pub fn compute_field_reveal_range(recv: &[u8], field_name: &str) -> Option<Range
 /// honest prover from building that layout; a dishonest one does not run this
 /// code at all.
 pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
-    json_member_in(body, field).map(|member| member.member)
+    JsonMember::in_body(body, field).map(|member| member.member)
 }
 
 /// A `"field":"value"` member, and the value inside it.
@@ -239,21 +239,72 @@ pub struct JsonMember {
     pub value: Range<usize>,
 }
 
-/// Locate the member and its value in one pass over `body`.
-fn json_member_in(body: &[u8], field: &str) -> Option<JsonMember> {
-    let needle = format!("\"{field}\":\"");
-    let start = find_first(body, needle.as_bytes())?;
-    let value = start.checked_add(needle.len())?;
-    let close = body
-        .get(value..)?
-        .iter()
-        .position(|&b| b == b'"')?
-        .checked_add(value)?;
-    Some(JsonMember {
-        // From the opening `"` of the key through the closing `"` of the value.
-        member: start..close.checked_add(1)?,
-        value: value..close,
-    })
+impl JsonMember {
+    /// The member named `field` in `body`, with offsets INTO `body`.
+    ///
+    /// Raw bytes in, raw offsets out: this scans whatever it is handed, so a
+    /// caller passing a whole HTTP response gets whichever match comes first --
+    /// a header's, if a header carries the delimiter. [`JsonMember::in_response`]
+    /// is the one that locates the body first, and is what a caller building a
+    /// reveal layout wants.
+    ///
+    /// A constructor on the type it produces: `json_member_in` restated the type
+    /// in the function name, stranded a preposition on the end of it, and left
+    /// the coordinate system -- the thing this module gets wrong most
+    /// expensively -- unsaid.
+    ///
+    /// The template it matches, and why that template is exactly the reader's,
+    /// is argued on [`find_json_snippet_range`], which is the public face of
+    /// this scan.
+    fn in_body(body: &[u8], field: &str) -> Option<Self> {
+        let needle = format!("\"{field}\":\"");
+        let start = find_first(body, needle.as_bytes())?;
+        let value = start.checked_add(needle.len())?;
+        let close = body
+            .get(value..)?
+            .iter()
+            .position(|&b| b == b'"')?
+            .checked_add(value)?;
+        Some(Self {
+            // From the opening `"` of the key through the closing `"` of the value.
+            member: start..close.checked_add(1)?,
+            value: value..close,
+        })
+    }
+
+    /// The member named `field_name` in an HTTP response, with offsets into the
+    /// RAW `recv` transcript.
+    ///
+    /// For a caller that reveals a member's delimiters and commits what sits
+    /// between them: both boundaries come from the scan that found them, so no
+    /// caller restates the template to recover one.
+    ///
+    /// The offsets are the whole difference from `in_body`, and the reason the
+    /// two are named apart rather than left to a `find_`/`compute_` prefix
+    /// nobody can decode. A reveal layout selects ranges of the TRANSCRIPT, so a
+    /// body-relative range handed to one selects bytes somewhere up in the
+    /// response headers -- a range that is well formed, signed, and pointing at
+    /// the wrong thing.
+    pub fn in_response(recv: &[u8], field_name: &str) -> Option<Self> {
+        let body_range = find_response_body_range(recv)?;
+        let raw_body = &recv[body_range.clone()];
+        let decoded_body = extract_response_body(recv).ok()?;
+
+        // Found in both: the decoded body says the member exists, the raw body says
+        // where it sits, and the two must hold the same bytes.
+        let decoded = Self::in_body(&decoded_body, field_name)?;
+        let raw = Self::in_body(raw_body, field_name)?;
+        require_contiguous(
+            raw_body.get(raw.member.clone())?,
+            decoded_body.get(decoded.member)?,
+        )?;
+
+        let at = |offset: usize| body_range.start.checked_add(offset);
+        Some(Self {
+            member: at(raw.member.start)?..at(raw.member.end)?,
+            value: at(raw.value.start)?..at(raw.value.end)?,
+        })
+    }
 }
 
 /// The first occurrence of `needle`, or nothing.
@@ -310,33 +361,7 @@ pub fn compute_field_snippet_range(
     recv: &[u8],
     field_name: &str,
 ) -> Option<Range<usize>> {
-    compute_json_member(recv, field_name).map(|found| found.member)
-}
-
-/// [`compute_field_snippet_range`], keeping the value boundary too.
-///
-/// For a caller that reveals a member's delimiters and commits what sits
-/// between them: the boundaries come from the scan that found them, so no
-/// caller restates the template to recover one.
-pub fn compute_json_member(recv: &[u8], field_name: &str) -> Option<JsonMember> {
-    let body_range = find_response_body_range(recv)?;
-    let raw_body = &recv[body_range.clone()];
-    let decoded_body = extract_response_body(recv).ok()?;
-
-    // Found in both: the decoded body says the member exists, the raw body says
-    // where it sits, and the two must hold the same bytes.
-    let decoded = json_member_in(&decoded_body, field_name)?;
-    let raw = json_member_in(raw_body, field_name)?;
-    require_contiguous(
-        raw_body.get(raw.member.clone())?,
-        decoded_body.get(decoded.member)?,
-    )?;
-
-    let at = |offset: usize| body_range.start.checked_add(offset);
-    Some(JsonMember {
-        member: at(raw.member.start)?..at(raw.member.end)?,
-        value: at(raw.value.start)?..at(raw.value.end)?,
-    })
+    JsonMember::in_response(recv, field_name).map(|found| found.member)
 }
 
 /// Like [`compute_id_snippet_range`] but only matches `field_name` after the
@@ -588,7 +613,7 @@ mod tests {
         out
     }
 
-    /// The property every caller of `compute_json_member` depends on: the
+    /// The property every caller of `JsonMember::in_response` depends on: the
     /// value sits inside the member, and what the member holds either side of
     /// it is exactly the two delimiters. A boundary that drifts breaks this
     /// before it reaches a layout, where the symptom is a committed bearer with
@@ -615,7 +640,7 @@ mod tests {
     #[test]
     fn the_member_brackets_its_value_with_the_two_delimiters() {
         let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"ghu_ABC\",\"x\":1}";
-        let found = compute_json_member(recv, "access_token").unwrap();
+        let found = JsonMember::in_response(recv, "access_token").unwrap();
         assert_brackets(recv, &found, "access_token", b"ghu_ABC");
     }
 
@@ -625,7 +650,7 @@ mod tests {
         // must not shorten the member -- a scan that stopped at one would
         // commit a prefix of the bearer and reveal the rest of it.
         let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"a:b,c}d\",\"x\":1}";
-        let found = compute_json_member(recv, "access_token").unwrap();
+        let found = JsonMember::in_response(recv, "access_token").unwrap();
         assert_brackets(recv, &found, "access_token", b"a:b,c}d");
     }
 
@@ -634,7 +659,7 @@ mod tests {
         // Found, not refused: whether an empty value is usable is the caller's
         // rule, and `token_response` has its own reason to refuse one.
         let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"\"}";
-        let found = compute_json_member(recv, "access_token").unwrap();
+        let found = JsonMember::in_response(recv, "access_token").unwrap();
         assert!(found.value.is_empty());
         assert_eq!(&recv[found.member.clone()], b"\"access_token\":\"\"");
     }
@@ -645,7 +670,7 @@ mod tests {
         // two must not drift apart.
         let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":1}";
         assert_eq!(
-            compute_json_member(recv, "login").unwrap().member,
+            JsonMember::in_response(recv, "login").unwrap().member,
             compute_field_snippet_range(recv, "login").unwrap()
         );
     }
