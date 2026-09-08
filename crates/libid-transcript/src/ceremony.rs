@@ -120,20 +120,36 @@ pub fn token_request(
 /// committed range is indistinguishable from a `refresh_token` value, or any
 /// other substring the prover chose to commit (REQ-PLAT-57, REQ-PLAT-58).
 pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
-    const ANCHOR: &[u8] = b"\"access_token\":\"";
-    let anchor_start = recv
-        .windows(ANCHOR.len())
-        .position(|w| w == ANCHOR)
+    const ANCHOR_LEN: usize = r#""access_token":""#.len();
+
+    // Through the shared reader rather than a scan of its own. That one locates
+    // the response BODY, so a header carrying this delimiter cannot answer
+    // first, and it refuses a member that chunk framing runs through -- which
+    // this direction cares about most, because the framing would land inside
+    // the committed bearer and the circuit would open a value the token service
+    // never returned.
+    let member = compute_field_snippet_range(recv, "access_token")
         .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
-    let value_start = anchor_start + ANCHOR.len();
-    let value_end = value_start
-        + recv[value_start..]
-            .iter()
-            .position(|&b| b == b'"')
-            .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
+
+    // The member is `"access_token":"<bearer>"`. Reveal the two delimiters; the
+    // complement commits the bearer between them.
+    let value_start = member
+        .start
+        .checked_add(ANCHOR_LEN)
+        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
+    let close = member
+        .end
+        .checked_sub(1)
+        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
+    // An empty bearer would leave the two reveals adjacent and commit nothing,
+    // and a response direction with no commitment is one the framing check on
+    // chain finds no bearer in.
+    if close <= value_start {
+        return Err(LayoutError::MissingField("access_token".into()));
+    }
 
     Ok(layout(
-        vec![anchor_start..value_start, value_end..value_end + 1],
+        vec![member.start..value_start, close..member.end],
         recv.len(),
     ))
 }
@@ -245,6 +261,48 @@ mod tests {
 
     const X_TOKEN_REQ: &[u8] =
         b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
+
+    #[test]
+    fn a_bearer_split_by_chunk_framing_is_refused() {
+        // The session Rust actually runs. Framing inside the committed range
+        // means the circuit opens bytes the token service never returned, and
+        // the on-chain framing check passes anyway because it reads the
+        // delimiters either side of the commitment, not its contents.
+        let mut recv = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [
+            r#"{"access_token":"ghu_AA"#,
+            r#"BB","token_type":"bearer"}"#,
+        ] {
+            recv.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            recv.extend_from_slice(part.as_bytes());
+            recv.extend_from_slice(b"\r\n");
+        }
+        recv.extend_from_slice(b"0\r\n\r\n");
+        assert!(token_response(&recv).is_err());
+    }
+
+    #[test]
+    fn a_header_cannot_answer_for_the_body() {
+        // The old scan started at byte zero, so a response header carrying the
+        // delimiter was matched before the body's own member.
+        let recv: &[u8] = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            r#"x-echo: "access_token":"decoy""#,
+            "\r\n\r\n",
+            r#"{"access_token":"real"}"#,
+        )
+        .as_bytes();
+        let l = token_response(recv).unwrap();
+        let revealed: Vec<u8> = l
+            .reveal
+            .iter()
+            .flat_map(|r| recv[r.clone()].to_vec())
+            .collect();
+        assert_eq!(revealed, br#""access_token":"""#.to_vec());
+        // The committed run is the bearer in the BODY, not the decoy.
+        let committed = l.commit.iter().find(|r| r.len() == 4).unwrap();
+        assert_eq!(&recv[committed.clone()], b"real");
+    }
 
     #[test]
     fn the_x_token_request_is_revealed_whole() {
