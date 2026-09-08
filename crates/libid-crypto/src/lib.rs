@@ -1,8 +1,8 @@
 //! Contract-agnostic crypto primitives shared across the libID stack.
 //!
 //! Everything here is generic Ethereum-flavoured cryptography: keccak256,
-//! EIP-191 signing/recovery, a sorted-pair keccak Merkle tree byte-compatible
-//! with OpenZeppelin's `MerkleProof`, and address helpers. Nothing in this
+//! EIP-191 signing and recovery -- the pair a notary signature is made and
+//! checked with -- and address helpers. Nothing in this
 //! crate knows about any specific contract ABI — the byte layouts a Solidity
 //! decoder has to agree with live in `libid-ceremony`.
 
@@ -49,50 +49,6 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     hasher.update(data);
     hasher.finalize(&mut output);
     output
-}
-
-/// Sign a message with a secp256k1 private key (Ethereum-style: keccak256
-/// prehash). Returns a 65-byte signature: r (32) || s (32) || v (1), with the
-/// raw 0/1 recovery byte (no EVM offset — see [`sign_eth_claim`] for the
-/// 27/28 convention).
-pub fn sign_message(key: &SigningKey, message: &[u8]) -> Result<Vec<u8>> {
-    let digest = keccak256(message);
-    let (sig, recid) = key.sign_prehash(&digest).map_err(|e| Error::CryptoFailed {
-        op: "sign".into(),
-        detail: format!("{e}"),
-    })?;
-    let sig: Signature = sig;
-    let mut out = Vec::with_capacity(65);
-    out.extend_from_slice(&sig.to_bytes());
-    out.push(recid.to_byte());
-    Ok(out)
-}
-
-/// Recover the public key from a 65-byte signature and the original message.
-pub fn recover_public_key(signature: &[u8], message: &[u8]) -> Result<VerifyingKey> {
-    if signature.len() != 65 {
-        return Err(Error::CryptoFailed {
-            op: "verify signature".into(),
-            detail: "signature must be 65 bytes".into(),
-        });
-    }
-    let sig =
-        Signature::from_slice(&signature[..64]).map_err(|e| Error::CryptoFailed {
-            op: "parse signature".into(),
-            detail: format!("{e}"),
-        })?;
-    let recid =
-        RecoveryId::from_byte(signature[64]).ok_or_else(|| Error::CryptoFailed {
-            op: "parse recovery id".into(),
-            detail: "invalid recovery id".into(),
-        })?;
-    let digest = keccak256(message);
-    VerifyingKey::recover_from_prehash(&digest, &sig, recid).map_err(|e| {
-        Error::CryptoFailed {
-            op: "recover public key".into(),
-            detail: format!("{e}"),
-        }
-    })
 }
 
 /// Convert a public key to an Ethereum address (last 20 bytes of keccak256 of
@@ -170,113 +126,6 @@ pub fn recover_eth_claim(signature: &[u8], digest: &[u8; 32]) -> Result<Verifyin
     })
 }
 
-/// Build an OpenZeppelin-compatible keccak256 Merkle tree root from leaves.
-pub fn build_merkle_tree(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return [0u8; 32];
-    }
-    if leaves.len() == 1 {
-        return leaves[0];
-    }
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-        for chunk in layer.chunks(2) {
-            if chunk.len() == 2 {
-                next.push(hash_pair(chunk[0], chunk[1]));
-            } else {
-                next.push(chunk[0]);
-            }
-        }
-        layer = next;
-    }
-    layer[0]
-}
-
-/// Generate a Merkle inclusion proof for the leaf at `index`.
-///
-/// # Panics
-///
-/// Panics if `index >= leaves.len()`.
-#[allow(clippy::arithmetic_side_effects)] // Index arithmetic is bounded by layer.len()
-pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
-    assert!(index < leaves.len(), "index out of range");
-    let mut proof = Vec::new();
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    let mut idx = index;
-    while layer.len() > 1 {
-        if idx.is_multiple_of(2) {
-            if idx + 1 < layer.len() {
-                proof.push(layer[idx + 1]);
-            }
-        } else {
-            proof.push(layer[idx - 1]);
-        }
-        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-        for chunk in layer.chunks(2) {
-            next.push(if chunk.len() == 2 {
-                hash_pair(chunk[0], chunk[1])
-            } else {
-                chunk[0]
-            });
-        }
-        layer = next;
-        idx /= 2;
-    }
-    proof
-}
-
-/// Verify a Merkle inclusion proof produced by [`merkle_proof`] against a
-/// root produced by [`build_merkle_tree`]. Byte-compatible with OpenZeppelin's
-/// `MerkleProof.verify`.
-pub fn merkle_verify(proof: &[[u8; 32]], root: [u8; 32], leaf: [u8; 32]) -> bool {
-    let mut cur = leaf;
-    for sibling in proof {
-        cur = hash_pair(cur, *sibling);
-    }
-    cur == root
-}
-
-/// Sorted-pair keccak hash — the OpenZeppelin node combine step.
-pub fn hash_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
-    if a < b {
-        keccak256(&[a.as_slice(), b.as_slice()].concat())
-    } else {
-        keccak256(&[b.as_slice(), a.as_slice()].concat())
-    }
-}
-
-/// Double-hashed Merkle leaf (OpenZeppelin style, prevents second-preimage):
-/// `keccak256(keccak256(prefix || value))`.
-///
-/// `prefix` accepts both `&str` (`"recv:"`) and `&[u8]` (`b"recv:"`) tags.
-pub fn double_hash_leaf(prefix: impl AsRef<[u8]>, value: &[u8]) -> [u8; 32] {
-    let mut inner = Vec::with_capacity(prefix.as_ref().len().saturating_add(value.len()));
-    inner.extend_from_slice(prefix.as_ref());
-    inner.extend_from_slice(value);
-    let inner_hash = keccak256(&inner);
-    keccak256(&inner_hash)
-}
-
-/// Parse a hex string (with or without a "0x" prefix) into a 20-byte
-/// Ethereum address.
-pub fn hex_to_address(hex_str: &str) -> Result<[u8; 20]> {
-    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(hex_str).map_err(|e| Error::CryptoFailed {
-        op: "parse address hex".into(),
-        detail: format!("{e}"),
-    })?;
-    if bytes.len() != 20 {
-        return Err(Error::CryptoFailed {
-            op: "parse address".into(),
-            detail: "address must be 20 bytes".into(),
-        });
-    }
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&bytes);
-    Ok(addr)
-}
-
 /// Parse a hex string (with or without a "0x" prefix) into a secp256k1
 /// signing key.
 pub fn hex_to_signing_key(hex_str: &str) -> Result<SigningKey> {
@@ -301,63 +150,21 @@ mod tests {
     const ANVIL_ADDR: &str = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
     #[test]
-    fn roundtrip_sign_recover() {
-        let (sk, vk) = generate_keypair();
-        let msg = b"hello world";
-        let sig = sign_message(&sk, msg).unwrap();
-        let recovered = recover_public_key(&sig, msg).unwrap();
-        assert_eq!(vk, recovered);
-    }
-
-    /// Every rejection below is a signature or key someone HANDED us. These
-    /// functions sit under the notary's signing and under whatever checks a
-    /// notary signature off chain, so malformed input is the ordinary case,
-    /// not the exotic one -- and each of these paths existed untested while
-    /// every happy path had a test.
-    #[test]
-    fn recovery_refuses_a_signature_that_is_not_sixty_five_bytes() {
-        let (sk, _) = generate_keypair();
-        let msg = b"hello world";
-        let sig = sign_message(&sk, msg).unwrap();
-
-        assert!(recover_public_key(&sig[..64], msg).is_err());
-        assert!(recover_public_key(&[], msg).is_err());
-        let mut long = sig.clone();
-        long.push(0);
-        assert!(recover_public_key(&long, msg).is_err());
-    }
-
-    #[test]
-    fn recovery_refuses_a_recovery_id_outside_the_two_it_can_mean() {
-        let (sk, _) = generate_keypair();
-        let msg = b"hello world";
-        let mut sig = sign_message(&sk, msg).unwrap();
-        // `sign_message` writes the raw 0/1 byte, so 27/28 is the EVM
-        // convention this function does NOT accept -- `recover_eth_claim` is
-        // the one that strips the offset.
-        sig[64] = 27;
-        assert!(recover_public_key(&sig, msg).is_err());
-        sig[64] = 4;
-        assert!(recover_public_key(&sig, msg).is_err());
-    }
-
-    #[test]
-    fn recovery_refuses_sixty_four_bytes_that_are_not_a_signature() {
-        // All zeros is not a valid (r, s): `s` must be non-zero and in the
-        // lower half of the order.
-        let zeros = [0u8; 65];
-        assert!(recover_public_key(&zeros, b"hello world").is_err());
-    }
-
-    #[test]
-    fn a_recovered_key_is_not_the_signer_of_other_bytes() {
+    fn a_recovered_key_is_not_the_signer_of_another_digest() {
         // Recovery ALWAYS produces a key for a well-formed signature -- it
         // cannot fail its way to safety. What makes it a check is comparing
-        // the result, and this is the case that comparison exists for.
+        // the result against a key the caller already trusts, which is what
+        // `NotaryService` does on chain with its trusted set. This is the case
+        // that comparison exists for.
         let (sk, vk) = generate_keypair();
-        let sig = sign_message(&sk, b"hello world").unwrap();
-        let other = recover_public_key(&sig, b"hello worlt").unwrap();
-        assert_ne!(vk, other, "a different message must not recover the signer");
+        let signed = keccak256(b"the record the notary saw");
+        let sig = sign_eth_claim(&sk, &signed).unwrap();
+
+        let other = recover_eth_claim(&sig, &keccak256(b"some other record")).unwrap();
+        assert_ne!(vk, other, "another digest must not recover the signer");
+        // And the signer does come back for the digest it signed, so the
+        // assertion above is about the digest and not about recovery failing.
+        assert_eq!(vk, recover_eth_claim(&sig, &signed).unwrap());
     }
 
     #[test]
@@ -389,23 +196,6 @@ mod tests {
         // the uncompressed point, which is what the address derivation hashes
         // and is a different encoding entirely.
         assert!(hex.starts_with("02") || hex.starts_with("03"), "{hex}");
-    }
-
-    #[test]
-    fn an_address_reads_with_or_without_the_prefix_and_refuses_the_rest() {
-        // This function had no test at all, in either direction.
-        let expected = [
-            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82,
-            0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
-        ];
-        let bare = "f39fd6e51aad88f6f4ce6ab8827279cffFb92266";
-        assert_eq!(hex_to_address(bare).unwrap(), expected);
-        assert_eq!(hex_to_address(&format!("0x{bare}")).unwrap(), expected);
-
-        // Nineteen bytes, twenty-one bytes, and something that is not hex.
-        assert!(hex_to_address("f39fd6e51aad88f6f4ce6ab8827279cffFb922").is_err());
-        assert!(hex_to_address("f39fd6e51aad88f6f4ce6ab8827279cffFb9226600").is_err());
-        assert!(hex_to_address("0xzz").is_err());
     }
 
     #[test]
@@ -469,78 +259,6 @@ mod tests {
         // …and so does the raw 0/1 form.
         sig[64] = sig[64].wrapping_sub(27);
         assert_eq!(recover_eth_claim(&sig, &digest).unwrap(), vk);
-    }
-
-    #[test]
-    fn merkle_tree_empty_and_single_leaf() {
-        assert_eq!(build_merkle_tree(&[]), [0u8; 32]);
-        let leaf = keccak256(b"leaf");
-        assert_eq!(build_merkle_tree(&[leaf]), leaf);
-    }
-
-    #[test]
-    fn merkle_tree_two_leaves() {
-        let a = keccak256(b"a");
-        let b = keccak256(b"b");
-        let root = build_merkle_tree(&[a, b]);
-        let expected = hash_pair(a, b);
-        assert_eq!(root, expected);
-    }
-
-    #[test]
-    fn merkle_proof_roundtrip() {
-        // Odd count exercises the promoted-node path.
-        let leaves: Vec<[u8; 32]> = (0..5u8).map(|i| keccak256(&[i])).collect();
-        let root = build_merkle_tree(&leaves);
-
-        for i in 0..leaves.len() {
-            let proof = merkle_proof(&leaves, i);
-            assert!(merkle_verify(&proof, root, leaves[i]), "leaf {}", i);
-        }
-    }
-
-    #[test]
-    fn merkle_proof_roundtrip_double_hashed_leaves() {
-        // The shape the notaries use: double-hashed prefixed leaves.
-        let leaves: Vec<[u8; 32]> = ["a", "b", "c", "d"]
-            .iter()
-            .map(|s| double_hash_leaf("recv:", s.as_bytes()))
-            .collect();
-        let root = build_merkle_tree(&leaves);
-        for i in 0..leaves.len() {
-            let proof = merkle_proof(&leaves, i);
-            assert!(merkle_verify(&proof, root, leaves[i]), "leaf {i}");
-        }
-    }
-
-    #[test]
-    fn merkle_proof_rejects_wrong_leaf() {
-        let leaves: Vec<[u8; 32]> = (0..4u8).map(|i| keccak256(&[i])).collect();
-        let root = build_merkle_tree(&leaves);
-        let proof = merkle_proof(&leaves, 0);
-        assert!(!merkle_verify(&proof, root, keccak256(b"forged")));
-    }
-
-    #[test]
-    fn double_hash_leaf_matches_solidity() {
-        let value = keccak256(b"x123");
-        let leaf = double_hash_leaf("identity", &value);
-        let mut inner = Vec::new();
-        inner.extend_from_slice(b"identity");
-        inner.extend_from_slice(&value);
-        let expected = keccak256(&keccak256(&inner));
-        assert_eq!(leaf, expected);
-    }
-
-    #[test]
-    fn double_hash_leaf_str_and_bytes_prefixes_agree() {
-        // The original call sites pass `"recv:"`, the jwks prover passed
-        // `b"recv:"` — both must hash identically now that they share one
-        // implementation.
-        assert_eq!(
-            double_hash_leaf("recv:", b"payload"),
-            double_hash_leaf(b"recv:".as_slice(), b"payload"),
-        );
     }
 
     /// Regression: comment-uid encoding must match Solidity

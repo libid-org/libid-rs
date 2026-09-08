@@ -72,15 +72,12 @@ pub use hyper::{
     Request as HttpRequest,
 };
 pub use session::{
-    extract_handshake_data,
-    prover,
     prover_generic,
     root_store,
     verifier,
     CommitmentOpening,
     ProverResult,
     ProverStep,
-    UserInfoParams,
     VerifierResult,
     MAX_RECV_DATA,
     MAX_SENT_DATA,
