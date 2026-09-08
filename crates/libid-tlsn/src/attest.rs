@@ -124,11 +124,7 @@ impl ObservedSession<'_> {
     /// observe.
     pub fn attested_data(&self) -> Result<AttestedData, AttestError> {
         Ok(AttestedData {
-            // The canonical authority of section 9: the lowercase ASCII TLS
-            // server name the notary authenticated, with no trailing dot.
-            authority_id: AttestedData::authority_id_of(
-                &self.authority.to_ascii_lowercase(),
-            ),
+            authority_id: AttestedData::authority_id_of(self.authority),
             created_at: self.created_at,
             sent_transcript_length: u32_of(self.transcript.len_sent())?,
             recv_transcript_length: u32_of(self.transcript.len_received())?,
@@ -271,9 +267,18 @@ mod tests {
         transcript: &'a PartialTranscript,
         commitments: &'a [TranscriptCommitment],
     ) -> ObservedSession<'a> {
+        observed_at(transcript, commitments, "api.x.com")
+    }
+
+    /// The same, for the one test that varies the authority.
+    fn observed_at<'a>(
+        transcript: &'a PartialTranscript,
+        commitments: &'a [TranscriptCommitment],
+        authority: &'a str,
+    ) -> ObservedSession<'a> {
         ObservedSession {
             transcript,
-            authority: "api.x.com",
+            authority,
             commitments,
             created_at: 1_770_000_000,
         }
@@ -355,6 +360,21 @@ mod tests {
         assert_ne!(
             data.authority_id,
             AttestedData::authority_id_of("evil.example")
+        );
+    }
+
+    #[test]
+    fn the_authority_is_canonicalized_on_the_way_into_the_record() {
+        // The rule used to be kept here, by this call site remembering to
+        // lowercase. It now belongs to the constructor, so what this asserts is
+        // that the record still comes out canonical when the caller does not.
+        let (partial, commitments) = session();
+        let data = observed_at(&partial, &commitments, "API.X.com")
+            .attested_data()
+            .unwrap();
+        assert_eq!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.x.com")
         );
     }
 

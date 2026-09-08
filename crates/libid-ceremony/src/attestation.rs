@@ -105,6 +105,21 @@ impl AttestedData {
     /// where the prover wrote it. Naming the record puts the rule beside the
     /// field.
     ///
+    /// Canonicalization is ASCII lowercase, and it happens HERE rather than at
+    /// each caller. The id is compared on chain against a constant a profile
+    /// pins, and ASCII case is the one difference a TLS stack hands back
+    /// without anyone noticing: `API.x.com` authenticates the same server and
+    /// hashes to a different id. Left to the call site it is a step every
+    /// future caller has to remember, and the one that forgets produces
+    /// attestations that are signed, well formed, and refused by every verifier
+    /// with nothing pointing at the capital letter. It sat at the one caller in
+    /// `libid-tlsn` while the other passed a string that was already lowercase
+    /// -- a rule kept by accident.
+    ///
+    /// Section 9 also asks for no trailing dot, and this does NOT strip one,
+    /// exactly as `tag` did not. Changing what a signed field hashes belongs in
+    /// a change that argues for it and tests it, not in a rename.
+    ///
     /// A string rather than a server-name type: this crate is published and
     /// knows nothing about how a TLS library models a name, which is also what
     /// keeps this mapping testable without a session.
@@ -113,7 +128,7 @@ impl AttestedData {
     /// format, platform and session -- and those went with the fields the
     /// notary was handed rather than saw.
     pub fn authority_id_of(server_name: &str) -> [u8; 32] {
-        keccak256(server_name.as_bytes())
+        keccak256(server_name.to_ascii_lowercase().as_bytes())
     }
 
     /// Lay the record out. This does NOT judge it: a malformed record is the
@@ -193,6 +208,19 @@ mod tests {
         assert_eq!(
             hex::encode(sample().digest().unwrap()),
             CROSS_LANGUAGE_DIGEST
+        );
+    }
+
+    #[test]
+    fn the_authority_is_hashed_in_one_canonical_spelling() {
+        // REQ-COMMON-21A fixes the preimage as the lowercase ASCII server name.
+        // A profile pins this id as a constant, so a differently cased spelling
+        // of the same authenticated host would hash to an id no profile matches
+        // -- every genuine attestation for that host refused, with nothing
+        // pointing at the capital letter.
+        assert_eq!(
+            AttestedData::authority_id_of("API.X.com"),
+            AttestedData::authority_id_of("api.x.com")
         );
     }
 
