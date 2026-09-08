@@ -24,7 +24,7 @@ use libid_tlsn::attest::{
 };
 use libid_transcript::ceremony::{
     self,
-    IdShape,
+    profile,
     Layout,
 };
 use rangeset::set::RangeSet;
@@ -137,7 +137,8 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 
 #[test]
 fn the_token_session_produces_a_record_the_verifier_accepts() {
-    let sl = ceremony::token_request(TOKEN_SENT, None).unwrap();
+    let sl = ceremony::token_request(TOKEN_SENT, profile::X.token.unwrap().secret_field)
+        .unwrap();
     let rl = ceremony::token_response(TOKEN_RECV).unwrap();
     let data = record(TOKEN_SENT, TOKEN_RECV, &sl, &rl, 1_770_000_000);
 
@@ -186,9 +187,15 @@ fn the_token_session_produces_a_record_the_verifier_accepts() {
 
 #[test]
 fn the_identity_session_produces_a_record_the_verifier_accepts() {
+    let x_id = profile::X.identity.unwrap();
     let sl = ceremony::identity_request(ID_SENT).unwrap();
-    let rl = ceremony::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
-        .unwrap();
+    let rl = ceremony::identity_response(
+        ID_RECV,
+        x_id.id_field,
+        x_id.id_shape,
+        x_id.handle_field,
+    )
+    .unwrap();
     let data = record(ID_SENT, ID_RECV, &sl, &rl, 1_770_000_000);
 
     assert_tiles(&data.sent, data.sent_transcript_length, "identity request");
@@ -251,19 +258,26 @@ fn the_identity_session_produces_a_record_the_verifier_accepts() {
 /// the notary signs and what the Solidity decoder reads.
 #[test]
 fn both_sessions_encode_and_carry_their_own_lengths() {
+    let x_id = profile::X.identity.unwrap();
     for (sent, recv, sl, rl) in [
         (
             TOKEN_SENT,
             TOKEN_RECV,
-            ceremony::token_request(TOKEN_SENT, None).unwrap(),
+            ceremony::token_request(TOKEN_SENT, profile::X.token.unwrap().secret_field)
+                .unwrap(),
             ceremony::token_response(TOKEN_RECV).unwrap(),
         ),
         (
             ID_SENT,
             ID_RECV,
             ceremony::identity_request(ID_SENT).unwrap(),
-            ceremony::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
-                .unwrap(),
+            ceremony::identity_response(
+                ID_RECV,
+                x_id.id_field,
+                x_id.id_shape,
+                x_id.handle_field,
+            )
+            .unwrap(),
         ),
     ] {
         let data = record(sent, recv, &sl, &rl, 1_770_000_000);
@@ -284,7 +298,8 @@ fn the_github_exchange_commits_a_suffix_and_nothing_else() {
     const RECV: &[u8] =
         b"HTTP/1.1 200 OK\r\n\r\n{\"token_type\":\"bearer\",\"access_token\":\"SECRETBEARER\"}";
 
-    let sl = ceremony::token_request(SENT, Some("client_secret")).unwrap();
+    let sl = ceremony::token_request(SENT, profile::GITHUB.token.unwrap().secret_field)
+        .unwrap();
     let rl = ceremony::token_response(RECV).unwrap();
     let data = record(SENT, RECV, &sl, &rl, 1_770_000_000);
 

@@ -17,6 +17,8 @@
 //! Token-Exchange Service, for the token session. The other three sessions are
 //! the browser's.
 
+pub mod profile;
+
 use std::ops::Range;
 
 use crate::ranges::{
