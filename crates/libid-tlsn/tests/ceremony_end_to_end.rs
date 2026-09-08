@@ -18,10 +18,7 @@ use libid_ceremony::attestation::{
     AttestedData,
     DirectionBlock,
 };
-use libid_tlsn::attest::{
-    attested_data,
-    AttestationInput,
-};
+use libid_tlsn::attest::ObservedSession;
 use libid_transcript::ceremony::{
     IdShape,
     Layout,
@@ -53,7 +50,8 @@ fn hash32(byte: u8) -> TypedHash {
     }
 }
 
-/// Turn a pair of layouts into what a notary's verifier hands `attested_data`.
+/// Turn a pair of layouts into the [`ObservedSession`] a notary's verifier
+/// holds.
 ///
 /// This is the step a real session performs inside MPC: the prover states what
 /// it reveals, and the verifier ends up holding the revealed transcript and a
@@ -88,12 +86,13 @@ fn record(
         }));
     }
 
-    attested_data(
-        &partial,
-        "api.x.com",
-        &commitments,
-        AttestationInput { created_at },
-    )
+    ObservedSession {
+        transcript: &partial,
+        authority: "api.x.com",
+        commitments: &commitments,
+        created_at,
+    }
+    .attested_data()
     .expect("the layouts produce an attestable session")
 }
 
