@@ -309,6 +309,114 @@ mod tests {
         assert_eq!(vk, recovered);
     }
 
+    /// Every rejection below is a signature or key someone HANDED us. These
+    /// functions sit under the notary's signing and under whatever checks a
+    /// notary signature off chain, so malformed input is the ordinary case,
+    /// not the exotic one -- and each of these paths existed untested while
+    /// every happy path had a test.
+    #[test]
+    fn recovery_refuses_a_signature_that_is_not_sixty_five_bytes() {
+        let (sk, _) = generate_keypair();
+        let msg = b"hello world";
+        let sig = sign_message(&sk, msg).unwrap();
+
+        assert!(recover_public_key(&sig[..64], msg).is_err());
+        assert!(recover_public_key(&[], msg).is_err());
+        let mut long = sig.clone();
+        long.push(0);
+        assert!(recover_public_key(&long, msg).is_err());
+    }
+
+    #[test]
+    fn recovery_refuses_a_recovery_id_outside_the_two_it_can_mean() {
+        let (sk, _) = generate_keypair();
+        let msg = b"hello world";
+        let mut sig = sign_message(&sk, msg).unwrap();
+        // `sign_message` writes the raw 0/1 byte, so 27/28 is the EVM
+        // convention this function does NOT accept -- `recover_eth_claim` is
+        // the one that strips the offset.
+        sig[64] = 27;
+        assert!(recover_public_key(&sig, msg).is_err());
+        sig[64] = 4;
+        assert!(recover_public_key(&sig, msg).is_err());
+    }
+
+    #[test]
+    fn recovery_refuses_sixty_four_bytes_that_are_not_a_signature() {
+        // All zeros is not a valid (r, s): `s` must be non-zero and in the
+        // lower half of the order.
+        let zeros = [0u8; 65];
+        assert!(recover_public_key(&zeros, b"hello world").is_err());
+    }
+
+    #[test]
+    fn a_recovered_key_is_not_the_signer_of_other_bytes() {
+        // Recovery ALWAYS produces a key for a well-formed signature -- it
+        // cannot fail its way to safety. What makes it a check is comparing
+        // the result, and this is the case that comparison exists for.
+        let (sk, vk) = generate_keypair();
+        let sig = sign_message(&sk, b"hello world").unwrap();
+        let other = recover_public_key(&sig, b"hello worlt").unwrap();
+        assert_ne!(vk, other, "a different message must not recover the signer");
+    }
+
+    #[test]
+    fn the_eth_claim_recovery_refuses_what_it_cannot_read() {
+        let (sk, _) = generate_keypair();
+        let digest = keccak256(b"a claim");
+        let sig = sign_eth_claim(&sk, &digest).unwrap();
+
+        assert!(recover_eth_claim(&sig[..64], &digest).is_err());
+        let mut bad_v = sig.clone();
+        // Neither convention: 26 is below the EVM offset and above 0..=3.
+        bad_v[64] = 26;
+        assert!(recover_eth_claim(&bad_v, &digest).is_err());
+
+        // A readable `v` over sixty-four bytes that are not a signature: `s`
+        // must be non-zero and in the lower half of the order.
+        let mut zeros = [0u8; 65];
+        zeros[64] = 27;
+        assert!(recover_eth_claim(&zeros, &digest).is_err());
+    }
+
+    #[test]
+    fn a_public_key_hexes_as_its_thirty_three_compressed_bytes() {
+        let (_, vk) = generate_keypair();
+        let hex = pubkey_to_hex(&vk);
+        assert_eq!(hex.len(), 66, "33 bytes, two characters each");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // The compressed SEC1 form starts 02 or 03, never 04 -- that prefix is
+        // the uncompressed point, which is what the address derivation hashes
+        // and is a different encoding entirely.
+        assert!(hex.starts_with("02") || hex.starts_with("03"), "{hex}");
+    }
+
+    #[test]
+    fn an_address_reads_with_or_without_the_prefix_and_refuses_the_rest() {
+        // This function had no test at all, in either direction.
+        let expected = [
+            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82,
+            0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
+        ];
+        let bare = "f39fd6e51aad88f6f4ce6ab8827279cffFb92266";
+        assert_eq!(hex_to_address(bare).unwrap(), expected);
+        assert_eq!(hex_to_address(&format!("0x{bare}")).unwrap(), expected);
+
+        // Nineteen bytes, twenty-one bytes, and something that is not hex.
+        assert!(hex_to_address("f39fd6e51aad88f6f4ce6ab8827279cffFb922").is_err());
+        assert!(hex_to_address("f39fd6e51aad88f6f4ce6ab8827279cffFb9226600").is_err());
+        assert!(hex_to_address("0xzz").is_err());
+    }
+
+    #[test]
+    fn a_signing_key_refuses_hex_that_is_not_a_key() {
+        assert!(hex_to_signing_key("not hex at all").is_err());
+        // Well-formed hex of the wrong width.
+        assert!(hex_to_signing_key("0xdeadbeef").is_err());
+        // Zero is not a valid secp256k1 scalar.
+        assert!(hex_to_signing_key(&"00".repeat(32)).is_err());
+    }
+
     #[test]
     fn eth_address_deterministic() {
         let (_, vk) = generate_keypair();
