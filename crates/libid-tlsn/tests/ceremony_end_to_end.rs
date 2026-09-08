@@ -2,7 +2,7 @@
 //!
 //! Every piece of the ceremony has its own tests. What had none is the JOIN:
 //! `libid_transcript::ceremony` picks the ranges, `libid_tlsn::attest` turns a
-//! session into the section 9.1 record, and a Platform Verifier on chain then
+//! session into the attested-data record, and a Platform Verifier on chain then
 //! applies rules neither of them states. A layout can be internally consistent,
 //! encode cleanly, and still be refused.
 //!
@@ -23,7 +23,7 @@ use libid_tlsn::attest::{
     ObservedSession,
 };
 use libid_transcript::ceremony::{
-    IdShape,
+    profiles,
     Layout,
 };
 use rangeset::set::RangeSet;
@@ -137,7 +137,7 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 
 #[test]
 fn the_token_session_produces_a_record_the_verifier_accepts() {
-    let sl = Layout::token_request(TOKEN_SENT, None).unwrap();
+    let sl = Layout::token_request(TOKEN_SENT, &profiles::X.token.unwrap()).unwrap();
     let rl = Layout::token_response(TOKEN_RECV).unwrap();
     let data = record(TOKEN_SENT, TOKEN_RECV, &sl, &rl, 1_770_000_000);
 
@@ -187,8 +187,7 @@ fn the_token_session_produces_a_record_the_verifier_accepts() {
 #[test]
 fn the_identity_session_produces_a_record_the_verifier_accepts() {
     let sl = Layout::identity_request(ID_SENT).unwrap();
-    let rl = Layout::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
-        .unwrap();
+    let rl = Layout::identity_response(ID_RECV, &profiles::X.identity.unwrap()).unwrap();
     let data = record(ID_SENT, ID_RECV, &sl, &rl, 1_770_000_000);
 
     assert_tiles(&data.sent, data.sent_transcript_length, "identity request");
@@ -255,15 +254,14 @@ fn both_sessions_encode_and_carry_their_own_lengths() {
         (
             TOKEN_SENT,
             TOKEN_RECV,
-            Layout::token_request(TOKEN_SENT, None).unwrap(),
+            Layout::token_request(TOKEN_SENT, &profiles::X.token.unwrap()).unwrap(),
             Layout::token_response(TOKEN_RECV).unwrap(),
         ),
         (
             ID_SENT,
             ID_RECV,
             Layout::identity_request(ID_SENT).unwrap(),
-            Layout::identity_response(ID_RECV, "id", IdShape::JsonString, "username")
-                .unwrap(),
+            Layout::identity_response(ID_RECV, &profiles::X.identity.unwrap()).unwrap(),
         ),
     ] {
         let data = record(sent, recv, &sl, &rl, 1_770_000_000);
@@ -284,7 +282,7 @@ fn the_github_exchange_commits_a_suffix_and_nothing_else() {
     const RECV: &[u8] =
         b"HTTP/1.1 200 OK\r\n\r\n{\"token_type\":\"bearer\",\"access_token\":\"SECRETBEARER\"}";
 
-    let sl = Layout::token_request(SENT, Some("client_secret")).unwrap();
+    let sl = Layout::token_request(SENT, &profiles::GITHUB.token.unwrap()).unwrap();
     let rl = Layout::token_response(RECV).unwrap();
     let data = record(SENT, RECV, &sl, &rl, 1_770_000_000);
 

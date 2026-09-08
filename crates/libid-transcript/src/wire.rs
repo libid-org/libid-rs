@@ -24,8 +24,8 @@ use crate::{
 /// Maximum allowed message size (10 MB).
 const MAX_MSG_SIZE: usize = 10 * 1024 * 1024;
 
-/// The notary's answer to a completed session: the ceremony-common section 9.1
-/// record, and the signature over it.
+/// The notary's answer to a completed session: the attested-data record its
+/// profile pins, and the signature over it.
 ///
 /// It lives here rather than in either party because both speak it. The notary
 /// writes it -- onto the recovered socket for an MPC prover, and as the body of

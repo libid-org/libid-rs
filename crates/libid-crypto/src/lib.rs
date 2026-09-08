@@ -1,8 +1,8 @@
 //! Contract-agnostic crypto primitives shared across the libID stack.
 //!
 //! Everything here is generic Ethereum-flavoured cryptography: keccak256,
-//! EIP-191 signing/recovery, a sorted-pair keccak Merkle tree byte-compatible
-//! with OpenZeppelin's `MerkleProof`, and address helpers. Nothing in this
+//! EIP-191 signing and recovery -- the pair a notary signature is made and
+//! checked with -- and address helpers. Nothing in this
 //! crate knows about any specific contract ABI — the byte layouts a Solidity
 //! decoder has to agree with live in `libid-ceremony`.
 
@@ -148,6 +148,64 @@ mod tests {
     const ANVIL_KEY: &str =
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDR: &str = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    #[test]
+    fn a_recovered_key_is_not_the_signer_of_another_digest() {
+        // Recovery ALWAYS produces a key for a well-formed signature -- it
+        // cannot fail its way to safety. What makes it a check is comparing
+        // the result against a key the caller already trusts, which is what
+        // `NotaryService` does on chain with its trusted set. This is the case
+        // that comparison exists for.
+        let (sk, vk) = generate_keypair();
+        let signed = keccak256(b"the record the notary saw");
+        let sig = sign_eth_claim(&sk, &signed).unwrap();
+
+        let other = recover_eth_claim(&sig, &keccak256(b"some other record")).unwrap();
+        assert_ne!(vk, other, "another digest must not recover the signer");
+        // And the signer does come back for the digest it signed, so the
+        // assertion above is about the digest and not about recovery failing.
+        assert_eq!(vk, recover_eth_claim(&sig, &signed).unwrap());
+    }
+
+    #[test]
+    fn the_eth_claim_recovery_refuses_what_it_cannot_read() {
+        let (sk, _) = generate_keypair();
+        let digest = keccak256(b"a claim");
+        let sig = sign_eth_claim(&sk, &digest).unwrap();
+
+        assert!(recover_eth_claim(&sig[..64], &digest).is_err());
+        let mut bad_v = sig.clone();
+        // Neither convention: 26 is below the EVM offset and above 0..=3.
+        bad_v[64] = 26;
+        assert!(recover_eth_claim(&bad_v, &digest).is_err());
+
+        // A readable `v` over sixty-four bytes that are not a signature: `s`
+        // must be non-zero and in the lower half of the order.
+        let mut zeros = [0u8; 65];
+        zeros[64] = 27;
+        assert!(recover_eth_claim(&zeros, &digest).is_err());
+    }
+
+    #[test]
+    fn a_public_key_hexes_as_its_thirty_three_compressed_bytes() {
+        let (_, vk) = generate_keypair();
+        let hex = pubkey_to_hex(&vk);
+        assert_eq!(hex.len(), 66, "33 bytes, two characters each");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // The compressed SEC1 form starts 02 or 03, never 04 -- that prefix is
+        // the uncompressed point, which is what the address derivation hashes
+        // and is a different encoding entirely.
+        assert!(hex.starts_with("02") || hex.starts_with("03"), "{hex}");
+    }
+
+    #[test]
+    fn a_signing_key_refuses_hex_that_is_not_a_key() {
+        assert!(hex_to_signing_key("not hex at all").is_err());
+        // Well-formed hex of the wrong width.
+        assert!(hex_to_signing_key("0xdeadbeef").is_err());
+        // Zero is not a valid secp256k1 scalar.
+        assert!(hex_to_signing_key(&"00".repeat(32)).is_err());
+    }
 
     #[test]
     fn eth_address_deterministic() {

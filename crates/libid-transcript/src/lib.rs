@@ -8,11 +8,9 @@
 //! * [`ranges`] — HTTP/JSON byte-range math for selective disclosure: locate
 //!   headers, response bodies (chunked or not), and JSON field/snippet ranges
 //!   in a raw TLS transcript, and map them back to absolute transcript
-//!   offsets that become Merkle leaves.
+//!   offsets, which are what a reveal range and a commitment are stated in.
 //! * [`wire`] — the length-prefixed JSON protocol the notary and prover speak
 //!   over the recovered socket after MPC-TLS closes.
-//! * [`types`] — [`TlsHandshakeData`],
-//!   the notary's output as consumed by backends and on-chain verifiers.
 
 pub mod ceremony;
 pub mod ranges;

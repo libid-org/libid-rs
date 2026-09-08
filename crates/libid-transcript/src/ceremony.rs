@@ -66,15 +66,25 @@ fn complement(reveal: &[Range<usize>], len: usize) -> Vec<Range<usize>> {
     out
 }
 
-/// Which shape the platform's immutable identifier takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IdShape {
-    /// X: `"id":"2244994945"`.
-    JsonString,
-    /// GitHub: `"id":583231,` -- the terminator is revealed with it, because it
-    /// is what proves the digits are the whole number rather than a prefix.
-    JsonInteger,
-}
+/// The ceremony profiles, and the types a layout is built from.
+///
+/// Re-exported rather than restated. `libid-profiles` is generated in
+/// libid-contracts from `solidity/contracts/ceremony/profiles.json` -- the same
+/// file `CeremonyProfile.sol` is generated from -- so what a prover reveals and
+/// what a Platform Verifier compares it against come from one place. A table
+/// written again here would be a second copy of values whose whole problem is
+/// that copies drift in silence.
+///
+/// [`IdShape`] used to be declared here. It said the same thing the generated
+/// one says, and two spellings of one profile fact is the drift this crate now
+/// takes the table to avoid.
+pub use libid_profiles::{
+    self as profiles,
+    IdShape,
+    IdentitySession,
+    Profile,
+    TokenSession,
+};
 
 impl Layout {
     /// A layout that reveals these ranges of a direction `len` bytes long, and
@@ -127,9 +137,9 @@ impl Layout {
     /// commitment reaches the transcript end.
     pub fn token_request(
         sent: &[u8],
-        secret_field: Option<&str>,
+        session: &TokenSession,
     ) -> Result<Self, LayoutError> {
-        let Some(field) = secret_field else {
+        let Some(field) = session.secret_field else {
             return Ok(Self::revealing(core::iter::once(0..sent.len()), sent.len()));
         };
 
@@ -256,15 +266,15 @@ impl Layout {
     /// be an offset rather than a name.
     pub fn identity_response(
         recv: &[u8],
-        id_field: &str,
-        id_shape: IdShape,
-        handle_field: &str,
+        session: &IdentitySession,
     ) -> Result<Self, LayoutError> {
+        let (id_field, handle_field) = (session.id_field, session.handle_field);
+
         // The bare-integer form takes its structural terminator with it, which is
         // what proves the revealed digits are the whole number.
-        let id =
-            compute_id_snippet_range(recv, id_field, id_shape == IdShape::JsonString)
-                .ok_or_else(|| LayoutError::MissingField(id_field.into()))?;
+        let quoted = session.id_shape == IdShape::JsonString;
+        let id = compute_id_snippet_range(recv, id_field, quoted)
+            .ok_or_else(|| LayoutError::MissingField(id_field.into()))?;
         let handle = compute_field_snippet_range(recv, handle_field)
             .ok_or_else(|| LayoutError::MissingField(handle_field.into()))?;
 
@@ -292,6 +302,33 @@ mod tests {
             at = s.end;
         }
         at == len
+    }
+
+    /// The launch profiles these layouts are built for. Taking the arguments
+    /// from the table rather than restating them is what makes these tests
+    /// exercise the values a Platform Verifier actually compares against.
+    fn x_token() -> TokenSession {
+        libid_profiles::X
+            .token
+            .expect("x notarizes a token session")
+    }
+
+    fn x_identity() -> IdentitySession {
+        libid_profiles::X
+            .identity
+            .expect("x notarizes an identity session")
+    }
+
+    fn github_token() -> TokenSession {
+        libid_profiles::GITHUB
+            .token
+            .expect("github notarizes a token session")
+    }
+
+    fn github_identity() -> IdentitySession {
+        libid_profiles::GITHUB
+            .identity
+            .expect("github notarizes an identity session")
     }
 
     const X_TOKEN_REQ: &[u8] =
@@ -372,7 +409,7 @@ mod tests {
 
     #[test]
     fn the_x_token_request_is_revealed_whole() {
-        let l = Layout::token_request(X_TOKEN_REQ, None).unwrap();
+        let l = Layout::token_request(X_TOKEN_REQ, &x_token()).unwrap();
         assert_eq!(l.reveal, vec![0..X_TOKEN_REQ.len()]);
         assert!(l.commit.is_empty(), "X hides nothing in its token request");
         assert!(tiles(&l, X_TOKEN_REQ.len()));
@@ -381,7 +418,7 @@ mod tests {
     #[test]
     fn the_github_exchange_commits_only_its_secret() {
         let req: &[u8] = b"POST /login/oauth/access_token HTTP/1.1\r\nhost: github.com\r\n\r\nclient_id=Iv1.x&code=abc&code_verifier=xyz&client_secret=deadbeef";
-        let l = Layout::token_request(req, Some("client_secret")).unwrap();
+        let l = Layout::token_request(req, &github_token()).unwrap();
         assert_eq!(l.reveal.len(), 1);
         assert_eq!(l.commit.len(), 1);
         // The commitment is a suffix, which is why ordering it last matters.
@@ -395,7 +432,7 @@ mod tests {
     #[test]
     fn a_missing_secret_is_an_error_not_a_silent_reveal() {
         assert_eq!(
-            Layout::token_request(X_TOKEN_REQ, Some("client_secret")),
+            Layout::token_request(X_TOKEN_REQ, &github_token()),
             Err(LayoutError::MissingCredential)
         );
     }
@@ -441,8 +478,7 @@ mod tests {
     #[test]
     fn the_identity_response_reveals_both_members_whole() {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
-        let l = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
-            .unwrap();
+        let l = Layout::identity_response(recv, &x_identity()).unwrap();
         assert!(tiles(&l, recv.len()));
         assert_eq!(l.reveal.len(), 2);
         // Whole members, delimiters included -- so the verifier reads the
@@ -458,6 +494,68 @@ mod tests {
     }
 
     #[test]
+    fn the_github_identity_response_reveals_the_id_with_its_terminator() {
+        // GitHub's id is a BARE integer, so the two members are not the same
+        // shape: `login` closes on a quote, `id` closes on the structural byte
+        // after the digits. That byte is revealed WITH them, because it is what
+        // proves they are the whole number and not a prefix of a longer one --
+        // `CeremonyFields.tryJsonInteger` pins it to `,` or `}` and no other.
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"login\":\"octocat\",\"id\":583231,\"node_id\":\"MDQ=\"}";
+        let l = Layout::identity_response(recv, &github_identity()).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert_eq!(l.reveal.len(), 2);
+        assert_eq!(
+            recv[l.reveal[0].clone()].to_vec(),
+            b"\"login\":\"octocat\"".to_vec()
+        );
+        assert_eq!(
+            recv[l.reveal[1].clone()].to_vec(),
+            b"\"id\":583231,".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_github_id_closed_by_a_brace_is_revealed_the_same_way() {
+        // JSON member order is not the platform's promise, so the id can be
+        // last -- and then `}` closes it instead of `,`. The profile fixes both
+        // as acceptable; a layout that only ever produced one would refuse
+        // half of GitHub's honest responses.
+        let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":583231}";
+        let l = Layout::identity_response(recv, &github_identity()).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert_eq!(
+            recv[l.reveal[1].clone()].to_vec(),
+            b"\"id\":583231}".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_two_profiles_do_not_read_each_other_s_responses() {
+        // The point of taking the three arguments as one profile: crossed, they
+        // describe a session nobody ran, and that used to be four arguments
+        // away. Each direction is refused by the id, where the shapes differ.
+        let github: &[u8] =
+            b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":583231}";
+        let x: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"username\":\"alice\"}";
+
+        // X's shape wants `"id":"`, and GitHub's id is bare: it fails on the id.
+        assert_eq!(
+            Layout::identity_response(github, &x_identity()),
+            Err(LayoutError::MissingField("id".into()))
+        );
+
+        // And GitHub's shape wants digits where X puts a quoted string, so it
+        // fails on the id as well rather than reaching the handle. It did not
+        // always: the bare reader used to stop at the first `,`, which returned
+        // `"id":"7",` -- a quoted value read as though it were a number -- and
+        // left the mismatch to be caught by the handle name instead.
+        assert_eq!(
+            Layout::identity_response(x, &github_identity()),
+            Err(LayoutError::MissingField("id".into()))
+        );
+    }
+
+    #[test]
     fn a_response_that_names_the_handle_first_still_reveals_in_offset_order() {
         // JSON member order is not the platform's promise, and the arguments
         // are given id-first regardless. `Layout::revealing` is what reconciles
@@ -469,8 +567,7 @@ mod tests {
         // Every other fixture here happens to serialize `id` first, so this is
         // the one that exercises the sort.
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"username\":\"alice\",\"id\":\"7\"}";
-        let l = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
-            .unwrap();
+        let l = Layout::identity_response(recv, &x_identity()).unwrap();
         assert!(tiles(&l, recv.len()));
         assert_eq!(l.reveal.len(), 2);
         // Offset order, which here is the OPPOSITE of the argument order.
@@ -486,8 +583,7 @@ mod tests {
         // The point of committing the rest: nothing but the two members and
         // their delimiters reaches the chain.
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"name\":\"Al\",\"username\":\"alice\"}";
-        let l = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
-            .unwrap();
+        let l = Layout::identity_response(recv, &x_identity()).unwrap();
         assert!(tiles(&l, recv.len()));
         assert!(!l.commit.is_empty(), "the rest of the response is hidden");
         for r in &l.reveal {
@@ -510,8 +606,7 @@ mod tests {
     #[test]
     fn a_response_naming_a_member_twice_reveals_only_one() {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"username\":\"victim\",\"username\":\"alice\"}";
-        let l = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
-            .unwrap();
+        let l = Layout::identity_response(recv, &x_identity()).unwrap();
         assert!(tiles(&l, recv.len()));
         let revealed: usize = l
             .reveal
@@ -530,8 +625,40 @@ mod tests {
     fn a_missing_member_is_an_error() {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"data\":{\"id\":\"7\"}}";
         assert!(matches!(
-            Layout::identity_response(recv, "id", IdShape::JsonString, "username"),
+            Layout::identity_response(recv, &x_identity()),
             Err(LayoutError::MissingField(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod tables {
+    use super::profiles;
+
+    /// The ceremony profiles and the identity system name the same platforms.
+    ///
+    /// Two generated tables, deliberately: one says how a handle normalizes,
+    /// the other says what a session notarizes, and neither belongs inside the
+    /// other. libid-contracts keeps them apart the same way and asserts they
+    /// agree (`PlatformIdentity.t.sol::test_theTwoTablesAgree`), because a name
+    /// bound through one path and read through the other is two keyspaces for
+    /// one platform with nothing to make the divergence loud.
+    ///
+    /// Both crates are generated from libid-contracts, so this is not checking
+    /// our transcription -- it is checking that a consumer holding BOTH at
+    /// versions it chose independently holds one keyspace. They are separate
+    /// crates with separate version requirements, and a lockfile can pin a pair
+    /// that never shipped together.
+    #[test]
+    fn the_two_tables_name_the_same_platforms() {
+        use libid_identity::handle_vectors::{
+            PLATFORM_GITHUB_DOMAIN,
+            PLATFORM_GOOGLE_DOMAIN,
+            PLATFORM_X_DOMAIN,
+        };
+
+        assert_eq!(profiles::X.platform, PLATFORM_X_DOMAIN);
+        assert_eq!(profiles::GITHUB.platform, PLATFORM_GITHUB_DOMAIN);
+        assert_eq!(profiles::GOOGLE.platform, PLATFORM_GOOGLE_DOMAIN);
     }
 }

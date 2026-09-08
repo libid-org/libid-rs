@@ -1,5 +1,5 @@
-//! Turn what a notarized session produced into the attested data of
-//! ceremony-common section 9.1.
+//! Turn what a notarized session produced into the attested data a launch
+//! profile pins.
 //!
 //! This is the only place tlsn's view of a transcript meets libID's. The
 //! layering is deliberate: `libid-ceremony` owns the bytes and is publishable,
@@ -137,8 +137,12 @@ pub trait FromObserved<Source>: Sized {
 }
 
 impl FromObserved<ObservedSession<'_>> for AttestedData {
-    /// The record of a session, laid out as ceremony-common section 9.1 fixes
-    /// it.
+    /// The record of a session, in the layout the launch profiles pin.
+    ///
+    /// Section 9.1 of ceremony-common is attestation verification and its fee;
+    /// it fixes no byte of this. REQ-COMMON-18 leaves the format to the profile
+    /// author, which is why `libid_ceremony::attestation` is the definition
+    /// rather than a reading of one.
     ///
     /// The four values this reads were never four unrelated things: they are
     /// four readings of ONE session, which a caller previously had to keep in
@@ -154,7 +158,8 @@ impl FromObserved<ObservedSession<'_>> for AttestedData {
     ///
     /// This fails only where the session cannot be described by the format at
     /// all: an offset past its 32-bit field, a commitment under the wrong hash,
-    /// a commitment over disjoint ranges. It judges nothing else. Whether the
+    /// a commitment over disjoint ranges, a commitment hash that is not 32
+    /// bytes. It judges nothing else. Whether the
     /// ranges tile, whether the request carries exactly one credential header
     /// -- those are the Platform Verifier's decision and the client's dry run,
     /// and refusing here would only withhold a session the notary really did
@@ -277,7 +282,7 @@ mod tests {
 
     use super::*;
     use libid_transcript::ceremony::{
-        IdShape,
+        profiles,
         Layout,
     };
     use rangeset::set::RangeSet;
@@ -411,6 +416,42 @@ mod tests {
     }
 
     #[test]
+    fn the_record_names_the_authority_this_session_carried() {
+        // Every other test here observes `api.x.com`, so a record that ignored
+        // the session and hardcoded that host would satisfy all of them --
+        // including the two beside this one, whose names promise otherwise.
+        // This observes a different host, so only a record that reads the
+        // session can pass.
+        let (partial, commitments) = session();
+        let data = AttestedData::from_observed(observed_at(
+            &partial,
+            &commitments,
+            "api.github.com",
+        ))
+        .unwrap();
+        assert_eq!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.github.com")
+        );
+        assert_ne!(
+            data.authority_id,
+            AttestedData::authority_id_of("api.x.com")
+        );
+    }
+
+    #[test]
+    fn the_notarys_clock_reading_reaches_the_record() {
+        // The verifier's freshness window is measured from this field, so a
+        // record that dropped it would be judged on a time nobody observed.
+        // Nothing asserted it: `created_at: 0` passed the entire suite.
+        let (partial, commitments) = session();
+        let mut session_view = observed(&partial, &commitments);
+        session_view.created_at = 1_800_000_123;
+        let data = AttestedData::from_observed(session_view).unwrap();
+        assert_eq!(data.created_at, 1_800_000_123);
+    }
+
+    #[test]
     fn refuses_a_blake3_commitment() {
         // The notarization library's default. The circuit computes SHA-256, so
         // a prover left on defaults produces commitments it cannot open.
@@ -541,8 +582,7 @@ mod tests {
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{\"id\":\"2244994945\",\"name\":\"Al\",\"username\":\"alice\"}}";
 
         let s = Layout::identity_request(sent).unwrap();
-        let r = Layout::identity_response(recv, "id", IdShape::JsonString, "username")
-            .unwrap();
+        let r = Layout::identity_response(recv, &profiles::X.identity.unwrap()).unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
         assert_tiles(&data.received, data.recv_transcript_length);
@@ -557,7 +597,7 @@ mod tests {
         let sent: &[u8] = b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"SECRETBEARER\"}";
 
-        let s = Layout::token_request(sent, None).unwrap();
+        let s = Layout::token_request(sent, &profiles::X.token.unwrap()).unwrap();
         let r = Layout::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
@@ -573,7 +613,7 @@ mod tests {
         let sent: &[u8] = b"POST /login/oauth/access_token HTTP/1.1\r\nhost: github.com\r\n\r\nclient_id=Iv1.x&code=abc&code_verifier=xyz&client_secret=deadbeef";
         let recv: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"gho_SECRET\"}";
 
-        let s = Layout::token_request(sent, Some("client_secret")).unwrap();
+        let s = Layout::token_request(sent, &profiles::GITHUB.token.unwrap()).unwrap();
         let r = Layout::token_response(recv).unwrap();
         let data = round_trip(sent, recv, &s, &r);
         assert_tiles(&data.sent, data.sent_transcript_length);
