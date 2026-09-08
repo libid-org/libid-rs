@@ -18,7 +18,10 @@ use libid_ceremony::attestation::{
     AttestedData,
     DirectionBlock,
 };
-use libid_tlsn::attest::ObservedSession;
+use libid_tlsn::attest::{
+    FromObservedSession,
+    ObservedSession,
+};
 use libid_transcript::ceremony::{
     IdShape,
     Layout,
@@ -86,13 +89,12 @@ fn record(
         }));
     }
 
-    ObservedSession {
+    AttestedData::from_session(ObservedSession {
         transcript: &partial,
         authority: "api.x.com",
         commitments: &commitments,
         created_at,
-    }
-    .attested_data()
+    })
     .expect("the layouts produce an attestable session")
 }
 

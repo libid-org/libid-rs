@@ -62,8 +62,9 @@ pub struct ObservedSession<'a> {
     /// answered (REQ-COMMON-21, REQ-COMMON-21A).
     pub authority: &'a str,
     /// Every commitment the session produced, both directions together, in
-    /// whatever order the prover made them. [`ObservedSession::attested_data`]
-    /// splits them by direction and sorts them by offset, so a caller passes on
+    /// whatever order the prover made them.
+    /// [`AttestedData::from_session`] splits them by direction and sorts
+    /// them by offset, so a caller passes on
     /// what it was handed rather than pre-sorting a list the format reorders
     /// anyway.
     pub commitments: &'a [TranscriptCommitment],
@@ -95,17 +96,25 @@ fn u32_of(value: usize) -> Result<u32, AttestError> {
     u32::try_from(value).map_err(|_| AttestError::OffsetTooLarge(value))
 }
 
-impl ObservedSession<'_> {
-    /// Lay this session out as the [`AttestedData`] of ceremony-common
-    /// section 9.1.
+/// Building a record of what a session was OBSERVED to be.
+///
+/// A trait, because the constructor belongs on `AttestedData` and
+/// `AttestedData` is `libid-ceremony`'s: that crate is published to crates.io
+/// and must never name a tlsn type, so an inherent `impl` for it cannot live
+/// here. A LOCAL trait can, and may be implemented for any type at all -- so
+/// the constructor lands on the type it constructs, and the call site names
+/// what is being built before it names what it is being built from.
+///
+/// One implementor, deliberately. This is not an abstraction over records; it
+/// is the way to put a constructor where coherence would otherwise refuse one.
+/// Bring it into scope to use it, the way any extension trait is brought in.
+pub trait FromObservedSession: Sized {
+    /// The record of `session`, laid out as ceremony-common section 9.1 fixes
+    /// it.
     ///
-    /// A method rather than a constructor because the constructor form is not
-    /// available here: `AttestedData` is defined in `libid-ceremony`, which is
-    /// published to crates.io and must never name a tlsn type, so an inherent
-    /// impl for it cannot live in this crate. The object that owns the inputs
-    /// carries the producer instead -- and the four arguments this replaces
-    /// were never four unrelated things. They were four readings of one
-    /// session, which a caller had to keep in step by hand.
+    /// The four values this reads were never four unrelated things: they are
+    /// four readings of ONE session, which a caller previously had to keep in
+    /// step by hand across an argument list.
     ///
     /// The notary places nothing here that it derived by applying a profile
     /// rule -- no handle, no account identifier, no client identifier, no chain
@@ -122,17 +131,23 @@ impl ObservedSession<'_> {
     /// -- those are the Platform Verifier's decision and the client's dry run,
     /// and refusing here would only withhold a session the notary really did
     /// observe.
-    pub fn attested_data(&self) -> Result<AttestedData, AttestError> {
+    fn from_session(session: ObservedSession<'_>) -> Result<Self, AttestError>;
+}
+
+impl FromObservedSession for AttestedData {
+    fn from_session(session: ObservedSession<'_>) -> Result<Self, AttestError> {
         Ok(AttestedData {
-            authority_id: AttestedData::authority_id_of(self.authority),
-            created_at: self.created_at,
-            sent_transcript_length: u32_of(self.transcript.len_sent())?,
-            recv_transcript_length: u32_of(self.transcript.len_received())?,
-            sent: self.direction_block(Direction::Sent)?,
-            received: self.direction_block(Direction::Received)?,
+            authority_id: AttestedData::authority_id_of(session.authority),
+            created_at: session.created_at,
+            sent_transcript_length: u32_of(session.transcript.len_sent())?,
+            recv_transcript_length: u32_of(session.transcript.len_received())?,
+            sent: session.direction_block(Direction::Sent)?,
+            received: session.direction_block(Direction::Received)?,
         })
     }
+}
 
+impl ObservedSession<'_> {
     /// One direction's revealed runs and its commitments, both in ascending
     /// start order.
     ///
@@ -313,7 +328,7 @@ mod tests {
         // These appear nowhere in any signed field today, and REQ-COMMON-36
         // makes them the only source of the length the coverage check uses.
         let (partial, commitments) = session();
-        let data = observed(&partial, &commitments).attested_data().unwrap();
+        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
         assert_eq!(data.sent_transcript_length, SENT.len() as u32);
         assert_eq!(data.recv_transcript_length, RECV.len() as u32);
     }
@@ -321,7 +336,7 @@ mod tests {
     #[test]
     fn encodes_to_the_length_its_own_fields_imply() {
         let (partial, commitments) = session();
-        let data = observed(&partial, &commitments).attested_data().unwrap();
+        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
         let encoded = data.encode().unwrap();
 
         // No decoder here to round-trip against: decoding is the chain's and
@@ -344,14 +359,14 @@ mod tests {
         // The whole point: what the notary emits must satisfy the coverage
         // check the Platform Verifier runs, or no genuine session ever passes.
         let (partial, commitments) = session();
-        let data = observed(&partial, &commitments).attested_data().unwrap();
+        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
         assert_tiles(&data.sent, data.sent_transcript_length);
     }
 
     #[test]
     fn authority_is_the_authenticated_server_name() {
         let (partial, commitments) = session();
-        let data = observed(&partial, &commitments).attested_data().unwrap();
+        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
         assert_eq!(
             data.authority_id,
             AttestedData::authority_id_of("api.x.com")
@@ -369,9 +384,9 @@ mod tests {
         // lowercase. It now belongs to the constructor, so what this asserts is
         // that the record still comes out canonical when the caller does not.
         let (partial, commitments) = session();
-        let data = observed_at(&partial, &commitments, "API.X.com")
-            .attested_data()
-            .unwrap();
+        let data =
+            AttestedData::from_session(observed_at(&partial, &commitments, "API.X.com"))
+                .unwrap();
         assert_eq!(
             data.authority_id,
             AttestedData::authority_id_of("api.x.com")
@@ -388,7 +403,7 @@ mod tests {
         };
         h.hash.alg = HashAlgId::BLAKE3;
         assert!(matches!(
-            observed(&partial, &commitments).attested_data(),
+            AttestedData::from_session(observed(&partial, &commitments)),
             Err(AttestError::WrongCommitmentAlgorithm(_))
         ));
     }
@@ -404,7 +419,7 @@ mod tests {
             hash: hash32(7),
         })];
         assert!(matches!(
-            observed(&partial, &commitments).attested_data(),
+            AttestedData::from_session(observed(&partial, &commitments)),
             Err(AttestError::DisjointCommitment(2))
         ));
     }
@@ -440,7 +455,8 @@ mod tests {
         for recv in [RECV, other_recv] {
             let partial = Transcript::new(SENT, recv)
                 .to_partial(sent_revealed.clone(), RangeSet::from(0..recv.len()));
-            let data = observed(&partial, &commitments).attested_data().unwrap();
+            let data =
+                AttestedData::from_session(observed(&partial, &commitments)).unwrap();
             headers.push(data.encode().unwrap()[..144].to_vec());
         }
         assert_eq!(
@@ -454,13 +470,11 @@ mod tests {
         let b = Transcript::new(SENT, other_recv)
             .to_partial(sent_revealed, RangeSet::from(0..other_recv.len()));
         assert_ne!(
-            observed(&a, &commitments)
-                .attested_data()
+            AttestedData::from_session(observed(&a, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
-            observed(&b, &commitments)
-                .attested_data()
+            AttestedData::from_session(observed(&b, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
@@ -501,7 +515,7 @@ mod tests {
                 }));
             }
         }
-        observed(&partial, &commitments).attested_data().unwrap()
+        AttestedData::from_session(observed(&partial, &commitments)).unwrap()
     }
 
     #[test]

@@ -38,8 +38,8 @@ answers over the same socket:
 
 ```rust,ignore
 let result = libid_tlsn::verifier(socket).await?;
-// describe the session as a libid_tlsn::attest::ObservedSession and call
-// .attested_data() on it,
+// describe the session as a libid_tlsn::attest::ObservedSession and build
+// the record with AttestedData::from_session,
 // sign its digest with libid_signer::ManagedSigner, then:
 libid_transcript::write_msg(&mut result.recovered_io, &response).await?;
 ```
