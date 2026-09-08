@@ -924,11 +924,14 @@ mod tests {
     fn every_commitment_this_prover_configures_is_sha256() {
         let transcript =
             Transcript::new(b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nx");
-        let config = transcript_commit_config(&transcript, &[0..4], &[0..4])
-            .expect("the ranges are inside the transcript");
+        // Two ranges per direction: the algorithm is per commitment, so one
+        // range could not tell a default applied once from one applied to each.
+        let config =
+            transcript_commit_config(&transcript, &[0..4, 6..10], &[0..4, 6..10])
+                .expect("the ranges are inside the transcript");
 
         let algs: Vec<_> = config.iter_hash().map(|(_, alg)| *alg).collect();
-        assert_eq!(algs.len(), 2, "one commitment per direction");
+        assert_eq!(algs.len(), 4, "two commitments per direction");
         for alg in algs {
             assert_eq!(
                 alg,
