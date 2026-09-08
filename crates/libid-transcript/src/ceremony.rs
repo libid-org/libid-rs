@@ -534,8 +534,7 @@ mod tests {
     fn the_two_profiles_do_not_read_each_other_s_responses() {
         // The point of taking the three arguments as one profile: crossed, they
         // describe a session nobody ran, and that used to be four arguments
-        // away. Both directions fail -- but not symmetrically, and the field
-        // each names says why.
+        // away. Each direction is refused by the id, where the shapes differ.
         let github: &[u8] =
             b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":583231}";
         let x: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"7\",\"username\":\"alice\"}";
@@ -546,15 +545,14 @@ mod tests {
             Err(LayoutError::MissingField("id".into()))
         );
 
-        // The other way round does NOT fail on the id. GitHub's bare reader
-        // finds `"id":` and stops at the `,`, so it happily returns `"id":"7",`
-        // -- a quoted value read as though it were a number. What refuses the
-        // session is the handle: X calls it `username` and GitHub `login`.
-        // Worth knowing, because it says the id reader alone would not have
-        // caught the mismatch.
+        // And GitHub's shape wants digits where X puts a quoted string, so it
+        // fails on the id as well rather than reaching the handle. It did not
+        // always: the bare reader used to stop at the first `,`, which returned
+        // `"id":"7",` -- a quoted value read as though it were a number -- and
+        // left the mismatch to be caught by the handle name instead.
         assert_eq!(
             Layout::identity_response(x, &github_identity()),
-            Err(LayoutError::MissingField("login".into()))
+            Err(LayoutError::MissingField("id".into()))
         );
     }
 
