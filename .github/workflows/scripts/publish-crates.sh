@@ -21,8 +21,8 @@ version="${1:?usage: publish-crates.sh <version>}"
 : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN must be set}"
 
 # Dependency order: crypto has no intra-workspace deps; transcript is
-# standalone; attestations depends on crypto; signer dev-depends on crypto.
-CRATES=(libid-crypto libid-transcript libid-attestations libid-signer)
+# standalone; ceremony depends on crypto; signer dev-depends on crypto.
+CRATES=(libid-crypto libid-transcript libid-ceremony libid-signer)
 
 # Sparse-index path for a crate name (all our names are >= 4 chars).
 index_path() {

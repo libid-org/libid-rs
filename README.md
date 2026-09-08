@@ -10,8 +10,8 @@ digests the libID on-chain verifiers check.
 | Crate | crates.io | What it is |
 | --- | --- | --- |
 | `libid-crypto` | yes | Contract-agnostic primitives: keccak256, EIP-191 sign/recover (27/28 `v`, low-s), OpenZeppelin-compatible sorted-pair keccak Merkle tree (root, inclusion proofs, verify, double-hashed prefixed leaves), Ethereum address and hex-key helpers. Minimal deps: `k256`, `tiny-keccak`, `hex`. |
-| `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, JSON field and `"key":"value"` snippet ranges, bare-number id snippets, anchored lookups, notary reveal ranges); the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `EvmProof` / `NotaryResponse` / `TlsHandshakeData` types. |
-| `libid-attestations` | yes | Contract-ABI-shaped digest builders, byte-pinned against the Solidity verifiers: chain-bound notary digest, JWKS-rotation notary digest (legacy 6-slot), backend digest, identity hash, and the XZkVerifier token/me attestation digests with their op-tags. |
+| `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, JSON field and `"key":"value"` snippet ranges, bare-number id snippets, anchored lookups, notary reveal ranges); the per-session ceremony reveal layouts; the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `AttestationWire` and `TlsHandshakeData` types. |
+| `libid-ceremony` | yes | The attested-data record a notary signs: the types a Platform Profile pins, their big-endian fixed-width encoder, and the keccak256 over it that is the only preimage a notary signs. Also the GitHub Token Service request and response records with the bounds a served call must satisfy. |
 | `libid-signer` | yes | `ManagedSigner` — one signing identity over a local hex key or an AWS KMS key: EIP-191 claim signing (byte-compatible with `libid_crypto::sign_eth_claim`), bare prehash signing (the tlsn `Secp256k1Eth` format), alloy transaction wallets, public-key accessors, and `SignerSource::from_spec` shape-classified key-spec parsing (64-hex → local key, anything else → KMS). |
 | `libid-tlsn` | **no — git only** | The MPC-TLS session driver over the upstream `tlsn` crate: `prover` / `prover_generic` / `verifier` over any async socket, TLS 1.2 handshake-data extraction, WebPKI root store. |
 
@@ -27,16 +27,9 @@ libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 ```
 
 The crate split exists precisely so this caveat stays contained: everything
-that does not need `tlsn` types — range math, wire protocol, proof types,
-digests, signing — is published normally and never drags the git pin into
-your lockfile.
-
-## Feature flags
-
-* `libid-transcript/ts` — derives `ts_rs::TS` on `EvmProof` and
-  `NotaryResponse` for TypeScript bindings generation. Off by default so
-  production builds don't carry `ts-rs`.
-* `libid-tlsn` and everything else: no features.
+that does not need `tlsn` types — range math, reveal layouts, the attested-data
+record, wire protocol, signing — is published normally and never drags the git
+pin into your lockfile.
 
 ## Usage sketch
 
@@ -45,9 +38,8 @@ answers over the same socket:
 
 ```rust,ignore
 let result = libid_tlsn::verifier(socket).await?;
-// inspect result.partial_transcript / result.tls_transcript, build an
-// EvmProof with libid_crypto merkle + libid_attestations digests, sign it
-// with libid_signer::ManagedSigner, then:
+// build the attested data from the session with libid_tlsn::attested_data,
+// sign its digest with libid_signer::ManagedSigner, then:
 libid_transcript::write_msg(&mut result.recovered_io, &response).await?;
 ```
 

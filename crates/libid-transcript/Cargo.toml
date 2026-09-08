@@ -5,16 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "tlsn-free half of the libID MPC-TLS toolkit: HTTP/JSON transcript range math for selective disclosure, the length-prefixed JSON notary wire protocol, and the EvmProof/NotaryResponse proof types."
+description = "tlsn-free half of the libID MPC-TLS toolkit: HTTP/JSON transcript range math for selective disclosure, the ceremony reveal layouts, and the length-prefixed JSON protocol a notary and a prover speak once MPC-TLS closes."
 keywords = ["tls", "notary", "zktls", "transcript", "mpc"]
 categories = ["cryptography", "parser-implementations"]
-
-[features]
-default = []
-# Derives `ts_rs::TS` on the proof types so TypeScript bindings can be
-# generated (`cargo test --features ts` writes them via ts-rs export tests
-# in the consumer).
-ts = ["dep:ts-rs"]
 
 [dependencies]
 httparse.workspace = true
@@ -22,7 +15,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
-ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
