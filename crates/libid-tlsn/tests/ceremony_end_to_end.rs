@@ -19,7 +19,7 @@ use libid_ceremony::attestation::{
     DirectionBlock,
 };
 use libid_tlsn::attest::{
-    FromObservedSession,
+    FromObserved,
     ObservedSession,
 };
 use libid_transcript::ceremony::{
@@ -89,7 +89,7 @@ fn record(
         }));
     }
 
-    AttestedData::from_session(ObservedSession {
+    AttestedData::from_observed(ObservedSession {
         transcript: &partial,
         authority: "api.x.com",
         commitments: &commitments,

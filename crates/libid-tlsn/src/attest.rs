@@ -63,7 +63,7 @@ pub struct ObservedSession<'a> {
     pub authority: &'a str,
     /// Every commitment the session produced, both directions together, in
     /// whatever order the prover made them.
-    /// [`AttestedData::from_session`] splits them by direction and sorts
+    /// [`AttestedData::from_observed`] splits them by direction and sorts
     /// them by offset, so a caller passes on
     /// what it was handed rather than pre-sorting a list the format reorders
     /// anyway.
@@ -96,20 +96,46 @@ fn u32_of(value: usize) -> Result<u32, AttestError> {
     u32::try_from(value).map_err(|_| AttestError::OffsetTooLarge(value))
 }
 
-/// Building a record of what a session was OBSERVED to be.
+/// One direction of an [`ObservedSession`], which is what a [`DirectionBlock`]
+/// is built from.
 ///
-/// A trait, because the constructor belongs on `AttestedData` and
-/// `AttestedData` is `libid-ceremony`'s: that crate is published to crates.io
-/// and must never name a tlsn type, so an inherent `impl` for it cannot live
-/// here. A LOCAL trait can, and may be implemented for any type at all -- so
-/// the constructor lands on the type it constructs, and the call site names
-/// what is being built before it names what it is being built from.
+/// A pair rather than two arguments, for the reason the session is a struct
+/// rather than four: a transcript and a commitment list must come from the SAME
+/// session or the block describes bytes nobody observed together. Carrying the
+/// whole session makes that pairing unspellable-wrong rather than merely
+/// uncommon, and leaves the direction as the only thing a caller chooses.
+#[derive(Clone, Copy)]
+pub struct ObservedDirection<'a> {
+    /// The session both directions are read from.
+    pub session: ObservedSession<'a>,
+    /// Which of its two directions this block covers.
+    pub direction: Direction,
+}
+
+/// Building a `libid-ceremony` record out of what this crate observed.
 ///
-/// One implementor, deliberately. This is not an abstraction over records; it
-/// is the way to put a constructor where coherence would otherwise refuse one.
-/// Bring it into scope to use it, the way any extension trait is brought in.
-pub trait FromObservedSession: Sized {
-    /// The record of `session`, laid out as ceremony-common section 9.1 fixes
+/// A trait, because both records belong to `libid-ceremony` and that crate is
+/// published to crates.io and must never name a tlsn type -- so an inherent
+/// `impl` for either cannot live here. A LOCAL trait can, and may be
+/// implemented for any type at all, so each constructor lands on the type it
+/// constructs and every call site names what is being built before it names
+/// what it is built from.
+///
+/// Two implementors, and the pair is the layering: an [`AttestedData`] is a
+/// header plus two [`DirectionBlock`]s, and its impl below is written that way
+/// rather than inlining the direction walk twice.
+///
+/// It is not an abstraction over records and no third implementor is expected.
+/// It is the way to put a constructor where coherence would otherwise refuse
+/// one. Bring it into scope to use it, as any extension trait is brought in.
+pub trait FromObserved<Source>: Sized {
+    /// The record `source` describes, or the reason the format cannot describe
+    /// it.
+    fn from_observed(source: Source) -> Result<Self, AttestError>;
+}
+
+impl FromObserved<ObservedSession<'_>> for AttestedData {
+    /// The record of a session, laid out as ceremony-common section 9.1 fixes
     /// it.
     ///
     /// The four values this reads were never four unrelated things: they are
@@ -131,47 +157,36 @@ pub trait FromObservedSession: Sized {
     /// -- those are the Platform Verifier's decision and the client's dry run,
     /// and refusing here would only withhold a session the notary really did
     /// observe.
-    fn from_session(session: ObservedSession<'_>) -> Result<Self, AttestError>;
-}
-
-impl FromObservedSession for AttestedData {
-    fn from_session(session: ObservedSession<'_>) -> Result<Self, AttestError> {
+    fn from_observed(session: ObservedSession<'_>) -> Result<Self, AttestError> {
+        let of = |direction| ObservedDirection { session, direction };
         Ok(AttestedData {
             authority_id: AttestedData::authority_id_of(session.authority),
             created_at: session.created_at,
             sent_transcript_length: u32_of(session.transcript.len_sent())?,
             recv_transcript_length: u32_of(session.transcript.len_received())?,
-            sent: session.direction_block(Direction::Sent)?,
-            received: session.direction_block(Direction::Received)?,
+            sent: DirectionBlock::from_observed(of(Direction::Sent))?,
+            received: DirectionBlock::from_observed(of(Direction::Received))?,
         })
     }
 }
 
-impl ObservedSession<'_> {
+impl FromObserved<ObservedDirection<'_>> for DirectionBlock {
     /// One direction's revealed runs and its commitments, both in ascending
     /// start order.
     ///
-    /// The direction is the only parameter, because everything else it reads
-    /// belongs to the session -- and the two it used to take apart, the
-    /// transcript and the commitment list, must come from the SAME session or
-    /// the block describes bytes nobody observed together. Holding them on
-    /// `self` makes that pairing unspellable-wrong rather than merely
-    /// uncommon.
-    ///
-    /// Private, and not a constructor: `DirectionBlock` is `libid-ceremony`'s,
-    /// so a constructor for it cannot live here either, and nothing outside
-    /// this file has a reason to build one direction alone.
-    fn direction_block(
-        &self,
-        direction: Direction,
-    ) -> Result<DirectionBlock, AttestError> {
-        let (authed, data) = match direction {
-            Direction::Sent => {
-                (self.transcript.sent_authed(), self.transcript.sent_unsafe())
-            }
+    /// Written once and asked twice rather than written twice and compared: the
+    /// two directions differ only in which pair of accessors they read, and a
+    /// second copy of this loop is a second place for the offset arithmetic to
+    /// drift.
+    fn from_observed(source: ObservedDirection<'_>) -> Result<Self, AttestError> {
+        let (authed, data) = match source.direction {
+            Direction::Sent => (
+                source.session.transcript.sent_authed(),
+                source.session.transcript.sent_unsafe(),
+            ),
             Direction::Received => (
-                self.transcript.received_authed(),
-                self.transcript.received_unsafe(),
+                source.session.transcript.received_authed(),
+                source.session.transcript.received_unsafe(),
             ),
         };
 
@@ -192,13 +207,13 @@ impl ObservedSession<'_> {
         }
 
         let mut out = Vec::new();
-        for commitment in self.commitments {
+        for commitment in source.session.commitments {
             // The enum is non-exhaustive upstream, so an unknown commitment kind
             // is skipped rather than assumed to be a hash.
             let TranscriptCommitment::Hash(hash) = commitment else {
                 continue;
             };
-            if hash.direction != direction {
+            if hash.direction != source.direction {
                 continue;
             }
             // The notarization library defaults to BLAKE3 while the Proving Circuit
@@ -328,7 +343,7 @@ mod tests {
         // These appear nowhere in any signed field today, and REQ-COMMON-36
         // makes them the only source of the length the coverage check uses.
         let (partial, commitments) = session();
-        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_eq!(data.sent_transcript_length, SENT.len() as u32);
         assert_eq!(data.recv_transcript_length, RECV.len() as u32);
     }
@@ -336,7 +351,7 @@ mod tests {
     #[test]
     fn encodes_to_the_length_its_own_fields_imply() {
         let (partial, commitments) = session();
-        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         let encoded = data.encode().unwrap();
 
         // No decoder here to round-trip against: decoding is the chain's and
@@ -359,14 +374,14 @@ mod tests {
         // The whole point: what the notary emits must satisfy the coverage
         // check the Platform Verifier runs, or no genuine session ever passes.
         let (partial, commitments) = session();
-        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_tiles(&data.sent, data.sent_transcript_length);
     }
 
     #[test]
     fn authority_is_the_authenticated_server_name() {
         let (partial, commitments) = session();
-        let data = AttestedData::from_session(observed(&partial, &commitments)).unwrap();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_eq!(
             data.authority_id,
             AttestedData::authority_id_of("api.x.com")
@@ -385,7 +400,7 @@ mod tests {
         // that the record still comes out canonical when the caller does not.
         let (partial, commitments) = session();
         let data =
-            AttestedData::from_session(observed_at(&partial, &commitments, "API.X.com"))
+            AttestedData::from_observed(observed_at(&partial, &commitments, "API.X.com"))
                 .unwrap();
         assert_eq!(
             data.authority_id,
@@ -403,7 +418,7 @@ mod tests {
         };
         h.hash.alg = HashAlgId::BLAKE3;
         assert!(matches!(
-            AttestedData::from_session(observed(&partial, &commitments)),
+            AttestedData::from_observed(observed(&partial, &commitments)),
             Err(AttestError::WrongCommitmentAlgorithm(_))
         ));
     }
@@ -419,7 +434,7 @@ mod tests {
             hash: hash32(7),
         })];
         assert!(matches!(
-            AttestedData::from_session(observed(&partial, &commitments)),
+            AttestedData::from_observed(observed(&partial, &commitments)),
             Err(AttestError::DisjointCommitment(2))
         ));
     }
@@ -456,7 +471,7 @@ mod tests {
             let partial = Transcript::new(SENT, recv)
                 .to_partial(sent_revealed.clone(), RangeSet::from(0..recv.len()));
             let data =
-                AttestedData::from_session(observed(&partial, &commitments)).unwrap();
+                AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
             headers.push(data.encode().unwrap()[..144].to_vec());
         }
         assert_eq!(
@@ -470,11 +485,11 @@ mod tests {
         let b = Transcript::new(SENT, other_recv)
             .to_partial(sent_revealed, RangeSet::from(0..other_recv.len()));
         assert_ne!(
-            AttestedData::from_session(observed(&a, &commitments))
+            AttestedData::from_observed(observed(&a, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
-            AttestedData::from_session(observed(&b, &commitments))
+            AttestedData::from_observed(observed(&b, &commitments))
                 .unwrap()
                 .encode()
                 .unwrap(),
@@ -515,7 +530,7 @@ mod tests {
                 }));
             }
         }
-        AttestedData::from_session(observed(&partial, &commitments)).unwrap()
+        AttestedData::from_observed(observed(&partial, &commitments)).unwrap()
     }
 
     #[test]
