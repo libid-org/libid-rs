@@ -286,6 +286,37 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_bearer_is_refused() {
+        // The two reveals would be adjacent, the complement would commit
+        // nothing, and `requireFramedCommitment` would find no bearer in a
+        // direction that carries no commitment at all.
+        let recv: &[u8] = br#"HTTP/1.1 200 OK"#;
+        let recv = [recv, b"\r\n\r\n", br#"{"access_token":""}"#].concat();
+        assert!(token_response(&recv).is_err());
+    }
+
+    #[test]
+    fn a_bearer_carrying_structural_bytes_is_committed_whole() {
+        // Only `"` closes the value. A scan stopping at `:` or `,` would
+        // commit a prefix and REVEAL the rest of the bearer.
+        let recv = [
+            b"HTTP/1.1 200 OK\r\n\r\n".as_slice(),
+            br#"{"access_token":"gh:u,A}BC","token_type":"bearer"}"#,
+        ]
+        .concat();
+        let l = token_response(&recv).unwrap();
+        assert!(tiles(&l, recv.len()));
+        assert!(l.commit.iter().any(|c| recv[c.clone()] == *b"gh:u,A}BC"));
+        // And no revealed run holds any part of it.
+        for r in &l.reveal {
+            assert!(
+                !recv[r.clone()].windows(3).any(|w| w == b"gh:"),
+                "the bearer must not appear in a revealed range"
+            );
+        }
+    }
+
+    #[test]
     fn a_header_cannot_answer_for_the_body() {
         // The old scan started at byte zero, so a response header carrying the
         // delimiter was matched before the body's own member.

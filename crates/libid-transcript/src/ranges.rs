@@ -588,6 +588,68 @@ mod tests {
         out
     }
 
+    /// The property every caller of `compute_json_member` depends on: the
+    /// value sits inside the member, and what the member holds either side of
+    /// it is exactly the two delimiters. A boundary that drifts breaks this
+    /// before it reaches a layout, where the symptom is a committed bearer with
+    /// a quote in it.
+    fn assert_brackets(recv: &[u8], found: &JsonMember, field: &str, value: &[u8]) {
+        assert!(
+            found.member.start <= found.value.start
+                && found.value.end <= found.member.end,
+            "the value must sit inside the member"
+        );
+        assert_eq!(&recv[found.value.clone()], value, "value bytes");
+        assert_eq!(
+            &recv[found.member.start..found.value.start],
+            format!("\"{field}\":\"").as_bytes(),
+            "opening delimiter"
+        );
+        assert_eq!(
+            &recv[found.value.end..found.member.end],
+            b"\"",
+            "closing quote"
+        );
+    }
+
+    #[test]
+    fn the_member_brackets_its_value_with_the_two_delimiters() {
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"ghu_ABC\",\"x\":1}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert_brackets(recv, &found, "access_token", b"ghu_ABC");
+    }
+
+    #[test]
+    fn a_value_carrying_structural_bytes_still_ends_at_its_quote() {
+        // Only `"` closes a JSON string, so a value holding `:`, `,` or `}`
+        // must not shorten the member -- a scan that stopped at one would
+        // commit a prefix of the bearer and reveal the rest of it.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"a:b,c}d\",\"x\":1}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert_brackets(recv, &found, "access_token", b"a:b,c}d");
+    }
+
+    #[test]
+    fn an_empty_value_is_found_with_an_empty_range() {
+        // Found, not refused: whether an empty value is usable is the caller's
+        // rule, and `token_response` has its own reason to refuse one.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"\"}";
+        let found = compute_json_member(recv, "access_token").unwrap();
+        assert!(found.value.is_empty());
+        assert_eq!(&recv[found.member.clone()], b"\"access_token\":\"\"");
+    }
+
+    #[test]
+    fn the_member_range_is_the_snippet_range() {
+        // `compute_field_snippet_range` is this with the value dropped, and the
+        // two must not drift apart.
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"login\":\"octocat\",\"id\":1}";
+        assert_eq!(
+            compute_json_member(recv, "login").unwrap().member,
+            compute_field_snippet_range(recv, "login").unwrap()
+        );
+    }
+
     #[test]
     fn a_member_split_by_chunk_framing_is_refused() {
         // Found in both bodies, and the raw range spans `\r\n<size>\r\n` in the
