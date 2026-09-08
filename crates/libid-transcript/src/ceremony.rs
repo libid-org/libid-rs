@@ -71,7 +71,19 @@ fn one(range: Range<usize>) -> Vec<Range<usize>> {
     core::iter::once(range).collect()
 }
 
-fn layout(reveal: Vec<Range<usize>>, len: usize) -> Layout {
+fn layout(mut reveal: Vec<Range<usize>>, len: usize) -> Layout {
+    // `complement` walks the reveals once, taking each as starting where the
+    // last one ended, so unsorted input reads as overlap and yields a
+    // complement that tiles nothing -- which the Platform Verifier rejects and
+    // nothing here would catch. Sorting is done once, here, so no caller has to
+    // remember: the layouts that build in order are unaffected, and
+    // `identity_response`, whose two members arrive in whatever order the
+    // platform serialized them, no longer carries a sort of its own.
+    reveal.sort_by_key(|r| r.start);
+    debug_assert!(
+        reveal.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "reveal ranges overlap: {reveal:?}"
+    );
     let commit = complement(&reveal, len);
     Layout { reveal, commit }
 }
@@ -206,10 +218,9 @@ pub fn identity_response(
     let handle = compute_field_snippet_range(recv, handle_field)
         .ok_or_else(|| LayoutError::MissingField(handle_field.into()))?;
 
-    // JSON member order is not fixed, so sort rather than assume.
-    let mut reveal = vec![id, handle];
-    reveal.sort_by_key(|r| r.start);
-    Ok(layout(reveal, recv.len()))
+    // JSON member order is not fixed; `layout` sorts, so this does not assume
+    // one.
+    Ok(layout(vec![id, handle], recv.len()))
 }
 
 #[cfg(test)]
