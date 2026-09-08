@@ -239,6 +239,23 @@ fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// The raw bytes are the member, and not the member with framing through it.
+///
+/// A chunked body carries `\r\n<size>\r\n` between chunks, and that framing
+/// holds no quote, comma or brace -- so a member split across a boundary is
+/// found in the decoded body AND in the raw one, and the raw range silently
+/// spans the framing. What that range selects is not the member: revealed, it
+/// puts framing inside the handle a verifier reads; committed, it puts framing
+/// inside the bearer a circuit opens against the clean value the caller was
+/// handed. Re-framing cannot repair it, because a commitment covers one
+/// contiguous run and this member is two.
+///
+/// So the session is refused here, where the reason is a decodable body rather
+/// than an unopenable commitment three components later.
+fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
+    (raw == decoded).then_some(())
+}
+
 /// Find the byte range of a bare (unquoted) JSON number snippet:
 /// `"key":<number>,`. The range runs from the key's opening `"` through the
 /// trailing `,` that follows the number (matching the on-chain `idSuffix=,`).
@@ -275,11 +292,14 @@ pub fn compute_field_snippet_range(
     let raw_body = &recv[body_range.clone()];
     let decoded_body = extract_response_body(recv).ok()?;
 
-    // Validate field exists in decoded body
-    let _decoded = find_json_snippet_range(&decoded_body, field_name)?;
-
-    // Find in raw body (may include chunk framing)
+    // Found in both: the decoded body says the member exists, the raw body says
+    // where it sits, and the two must hold the same bytes.
+    let decoded_range = find_json_snippet_range(&decoded_body, field_name)?;
     let raw_snippet_range = find_json_snippet_range(raw_body, field_name)?;
+    require_contiguous(
+        raw_body.get(raw_snippet_range.clone())?,
+        decoded_body.get(decoded_range)?,
+    )?;
 
     let start = body_range.start.checked_add(raw_snippet_range.start)?;
     let end = body_range.start.checked_add(raw_snippet_range.end)?;
@@ -304,22 +324,23 @@ pub fn compute_id_snippet_range_after(
 
     // Validate the anchored id against the DECODED body (chunk-framing stripped),
     // so a body that is chunked or contains decoy bytes can't drive the result.
-    {
-        let decoded = extract_response_body(recv).ok()?;
+    // The bytes it finds are kept, to be compared with the raw ones below.
+    let decoded = extract_response_body(recv).ok()?;
+    let decoded_member = {
         let danchor = decoded
             .windows(anchor_needle.len())
             .position(|w| w == anchor_needle.as_bytes())?;
-        let dsub = decoded.get(danchor.checked_add(anchor_needle.len())?..)?;
-        if quoted {
-            find_json_snippet_range(dsub, field_name)?;
+        let from = danchor.checked_add(anchor_needle.len())?;
+        let dsub = decoded.get(from..)?;
+        let rel = if quoted {
+            find_json_snippet_range(dsub, field_name)?
         } else {
-            find_json_bare_snippet_range(dsub, field_name)?;
-        }
-    }
+            find_json_bare_snippet_range(dsub, field_name)?
+        };
+        dsub.get(rel)?
+    };
 
-    // The Merkle leaf is over the RAW transcript, so map the range there. (A
-    // snippet split across a chunk boundary won't be found contiguously here and
-    // fails closed — never mis-resolves.)
+    // The Merkle leaf is over the RAW transcript, so map the range there.
     let anchor_pos = raw_body
         .windows(anchor_needle.len())
         .position(|w| w == anchor_needle.as_bytes())?;
@@ -331,6 +352,8 @@ pub fn compute_id_snippet_range_after(
     } else {
         find_json_bare_snippet_range(sub, field_name)?
     };
+    require_contiguous(sub.get(rel.clone())?, decoded_member)?;
+
     let base = body_range.start.checked_add(search_from)?;
     Some(base.checked_add(rel.start)?..base.checked_add(rel.end)?)
 }
@@ -352,9 +375,12 @@ pub fn compute_id_snippet_range(
     let raw_body = &recv[body_range.clone()];
     let decoded_body = extract_response_body(recv).ok()?;
 
-    // Validate the snippet exists in the decoded body.
-    let _decoded = find_json_bare_snippet_range(&decoded_body, field_name)?;
+    let decoded_range = find_json_bare_snippet_range(&decoded_body, field_name)?;
     let raw_snippet_range = find_json_bare_snippet_range(raw_body, field_name)?;
+    require_contiguous(
+        raw_body.get(raw_snippet_range.clone())?,
+        decoded_body.get(decoded_range)?,
+    )?;
 
     let start = body_range.start.checked_add(raw_snippet_range.start)?;
     let end = body_range.start.checked_add(raw_snippet_range.end)?;
@@ -513,6 +539,50 @@ mod tests {
 
         let range = compute_field_snippet_range(recv, "body").unwrap();
         assert_eq!(&recv[range], br#""body":"hello world""#);
+    }
+
+    /// A chunked response whose `field` value is cut in half by a chunk
+    /// boundary. The framing carries no quote, comma or brace, so every scan
+    /// here runs straight through it.
+    fn straddling(head: &str, tail: &str) -> Vec<u8> {
+        let mut out = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [head, tail] {
+            out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            out.extend_from_slice(part.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    #[test]
+    fn a_member_split_by_chunk_framing_is_refused() {
+        // Found in both bodies, and the raw range spans `\r\n<size>\r\n` in the
+        // middle of the value. Revealed it would put framing inside the handle
+        // a verifier reads; committed, inside the bearer a circuit opens.
+        let recv = straddling(r#"{"login":"oct"#, r#"ocat","id":1}"#);
+        assert!(compute_field_snippet_range(&recv, "login").is_none());
+    }
+
+    #[test]
+    fn a_bare_id_split_by_chunk_framing_is_refused() {
+        let recv = straddling(r#"{"login":"octocat","id":12"#, r#"34,"x":1}"#);
+        assert!(compute_id_snippet_range(&recv, "id", false).is_none());
+    }
+
+    #[test]
+    fn an_anchored_id_split_by_chunk_framing_is_refused() {
+        let recv = straddling(r#"{"user":{"id":"12"#, r#"34"}}"#);
+        assert!(compute_id_snippet_range_after(&recv, "id", true, "user").is_none());
+    }
+
+    #[test]
+    fn a_chunked_member_inside_one_chunk_still_resolves() {
+        // The point is contiguity, not chunking: a body that happens to be
+        // chunked is fine as long as the member sits in one piece.
+        let recv = straddling(r#"{"login":"octocat","#, r#""id":1}"#);
+        let range = compute_field_snippet_range(&recv, "login").unwrap();
+        assert_eq!(&recv[range], br#""login":"octocat""#);
     }
 
     #[test]
