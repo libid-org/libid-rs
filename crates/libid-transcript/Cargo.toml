@@ -11,10 +11,13 @@ categories = ["cryptography", "parser-implementations"]
 
 [dependencies]
 httparse.workspace = true
+libid-profiles.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
+# The generated platform names, to check the profile table against.
+libid-identity.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-util"] }

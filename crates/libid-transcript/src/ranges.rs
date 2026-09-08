@@ -339,17 +339,31 @@ fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
 pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
     let needle = format!("\"{field}\":");
     let start = find_first(body, needle.as_bytes())?;
-    let digits = start.checked_add(needle.len())?;
-    // Bound the number by the first `,` or `}` after the colon.
-    let term = body
-        .get(digits..)?
-        .iter()
-        .position(|&b| b == b',' || b == b'}')?
-        .checked_add(digits)?;
+    let from = start.checked_add(needle.len())?;
+
+    // Digits, then the byte that closes them -- the order `tryJsonInteger`
+    // reads in. Scanning instead to the first `,` or `}` would accept
+    // `"id":"7",`, a quoted value returned as though it were a number: the
+    // chain then refuses it as noncanonical, which is the same answer given
+    // where nobody can see the reason.
+    let rest = body.get(from..)?;
+    let width = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if width == 0 {
+        return None;
+    }
+    // A leading zero is noncanonical, and `0` alone is not a leading zero.
+    if width > 1 && rest[0] == b'0' {
+        return None;
+    }
+
     // The terminator is revealed with the digits: it is what proves they are
-    // the whole number rather than a prefix of a longer one, and
-    // `CeremonyFields.tryJsonInteger` refuses any other byte there.
-    Some(start..term.checked_add(1)?)
+    // the whole number rather than a prefix of a longer one, and the profile
+    // fixes it as `,` or `}` and no other byte (REQ-PLAT-51).
+    let term = from.checked_add(width)?;
+    match body.get(term) {
+        Some(b',') | Some(b'}') => Some(start..term.checked_add(1)?),
+        _ => None,
+    }
 }
 
 /// Like [`compute_field_reveal_range`] but returns the range covering the
@@ -570,6 +584,36 @@ mod tests {
 
         let bare = br#"{"id" : 123}"#;
         assert!(find_json_bare_snippet_range(bare, "id").is_none());
+    }
+
+    #[test]
+    fn a_quoted_value_is_not_a_bare_number() {
+        // `tryJsonInteger` scans DIGITS and then demands the terminator. A scan
+        // that instead ran to the first `,` would return `"id":"7",` here, and
+        // the chain would refuse it as noncanonical -- the same answer, given
+        // where the reason is not visible.
+        let body = br#"{"login":"octocat","id":"7","x":1}"#;
+        assert!(find_json_bare_snippet_range(body, "id").is_none());
+    }
+
+    #[test]
+    fn a_leading_zero_is_refused_but_zero_itself_is_not() {
+        // `end - at > 1 && data[at] == "0"` on chain: `0123` is noncanonical,
+        // `0` is just zero.
+        assert!(find_json_bare_snippet_range(br#"{"id":0123,"x":1}"#, "id").is_none());
+        let zero = br#"{"id":0,"x":1}"#;
+        let range = find_json_bare_snippet_range(zero, "id").unwrap();
+        assert_eq!(&zero[range], br#""id":0,"#);
+    }
+
+    #[test]
+    fn a_terminator_the_profile_does_not_fix_is_refused() {
+        // Only `,` and `}` close the digits. A `]` means the id sat in an array
+        // the profile never described.
+        assert!(find_json_bare_snippet_range(br#"{"a":[1,"id":7]}"#, "id").is_none());
+        // And digits running to the end of the range have no terminator at all,
+        // which is `Found.None` on chain rather than a value.
+        assert!(find_json_bare_snippet_range(br#"{"id":7"#, "id").is_none());
     }
 
     #[test]
