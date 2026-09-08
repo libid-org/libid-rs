@@ -2,7 +2,7 @@
 //!
 //! Every piece of the ceremony has its own tests. What had none is the JOIN:
 //! `libid_transcript::ceremony` picks the ranges, `libid_tlsn::attest` turns a
-//! session into the section 9.1 record, and a Platform Verifier on chain then
+//! session into the attested-data record, and a Platform Verifier on chain then
 //! applies rules neither of them states. A layout can be internally consistent,
 //! encode cleanly, and still be refused.
 //!

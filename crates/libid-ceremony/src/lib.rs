@@ -15,11 +15,16 @@
 //! profile-specific.
 //!
 //! Where a check IS wanted before spending gas, it belongs in the client as a
-//! dry run -- and it already lives there. `@libid/contracts` exports
-//! `decodeAttestedData`, `validate`, `requireExactCoverage` and
-//! `requireBearerHeaderRequest` in TypeScript, which is what REQ-PLAT-44 has
-//! the Canonical Runtime call before it spends a second session on an
-//! attestation.
+//! dry run: REQ-PLAT-44 has the Canonical Runtime check an attestation before
+//! it spends a second session on one. This crate is still not where that runs
+//! -- the dry run reads the rules a verifier applies, and those are the
+//! chain's.
+//!
+//! An earlier version of this paragraph named four `@libid/contracts`
+//! TypeScript exports as the place it already lived. They do not exist:
+//! v0.8.0's ceremony package is the generated profile table and its index.
+//! Naming a client-side checker that has not been written invites the reader
+//! to skip writing one.
 //!
 //! The same reasoning removed the last labels. The notary used to stamp a
 //! format tag, a platform id and a session tag; it observed none of them. The
@@ -30,8 +35,8 @@
 //!
 //! So this crate holds one direction of one thing:
 //!
-//! * [`attestation`] -- the types of ceremony-common section 9.1 and the
-//!   encoder that lays them out. No decoder: whoever decodes also checks, and
+//! * [`attestation`] -- the attested-data types and the encoder that lays them
+//!   out. No decoder: whoever decodes also checks, and
 //!   that is the chain and the client.
 //! * [`token_exchange`] -- the GitHub Token Service's own request and response
 //!   records. Its validation stays, because REQ-PLAT-37 and REQ-PLAT-38 put

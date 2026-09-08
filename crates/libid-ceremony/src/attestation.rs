@@ -105,8 +105,16 @@ impl AttestedData {
     /// where the prover wrote it. Naming the record puts the rule beside the
     /// field.
     ///
-    /// Canonicalization is ASCII lowercase, and it happens HERE rather than at
-    /// each caller. The id is compared on chain against a constant a profile
+    /// The canonical form is ASCII lowercase, and it is OURS to fix, the way
+    /// the byte layout above is. REQ-COMMON-21A has the Platform Verifier
+    /// compare the authenticated authority byte for byte against the constants
+    /// its profile pins; which bytes those are is the profile author's
+    /// decision, and this is where this implementation makes it. The generated
+    /// table in `libid-contracts` makes the same one and refuses any authority
+    /// that is not lowercase and free of a trailing dot, so the two agree at
+    /// the source rather than by coincidence.
+    ///
+    /// It happens HERE rather than at each caller. The id is compared on chain against a constant a profile
     /// pins, and ASCII case is the one difference a TLS stack hands back
     /// without anyone noticing: `API.x.com` authenticates the same server and
     /// hashes to a different id. Left to the call site it is a step every
@@ -116,13 +124,17 @@ impl AttestedData {
     /// `libid-tlsn` while the other passed a string that was already lowercase
     /// -- a rule kept by accident.
     ///
-    /// Section 9 also asks for no trailing dot, and this does NOT strip one,
-    /// exactly as `tag` did not. Changing what a signed field hashes belongs in
-    /// a change that argues for it and tests it, not in a rename.
+    /// The same sentence of section 9 that gives the lowercase form also says
+    /// no trailing dot, and this does NOT strip one. A dotted name therefore
+    /// hashes to an id no profile matches, and the session is refused -- which
+    /// is the safe direction, but it is a refusal rather than a repair. Fixing
+    /// it needs a caller that can produce the FQDN form, and a test; it is not
+    /// a rename's business to change what a signed field hashes.
     ///
-    /// A string rather than a server-name type: this crate is published and
-    /// knows nothing about how a TLS library models a name, which is also what
-    /// keeps this mapping testable without a session.
+    /// A string rather than a server-name type: this crate carries three
+    /// dependencies and no TLS library at all, so it knows nothing about how
+    /// one models a name -- which is also what keeps this mapping testable
+    /// without a session.
     ///
     /// The record's one remaining 32-byte tag. It used to serve three more --
     /// format, platform and session -- and those went with the fields the

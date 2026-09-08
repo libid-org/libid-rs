@@ -37,8 +37,10 @@ use tlsn::{
         Direction,
         PartialTranscript,
         TlsTranscript,
+        Transcript,
         TranscriptCommitConfig,
         TranscriptCommitment,
+        TranscriptCommitmentKind,
         TranscriptSecret,
     },
     verifier::{
@@ -149,6 +151,46 @@ pub fn root_store() -> RootCertStore {
             .map(|c| CertificateDer(c.to_vec()))
             .collect(),
     }
+}
+
+/// What this session commits to, and under which hash.
+///
+/// Split out of `prover_generic` so the algorithm is assertable without an
+/// MPC session: the config is the only place the choice is made, and it is
+/// made here rather than by a caller, because `select_layout` hands back
+/// ranges and no algorithm.
+fn transcript_commit_config(
+    transcript: &Transcript,
+    sent: &[std::ops::Range<usize>],
+    recv: &[std::ops::Range<usize>],
+) -> Result<TranscriptCommitConfig> {
+    let mut builder = TranscriptCommitConfig::builder(transcript);
+    // REQ-COMMON-38. The notarization library defaults to BLAKE3 and the
+    // Proving Circuit computes SHA-256, so a prover left on that default
+    // produces commitments the circuit cannot open -- and which
+    // `AttestedData::from_observed` refuses, after a whole MPC-TLS session has
+    // been paid for. It is set here because `select_layout` hands back ranges
+    // and no algorithm, so no caller can correct it.
+    builder.default_kind(TranscriptCommitmentKind::Hash {
+        alg: HashAlgId::SHA256,
+    });
+    for range in sent {
+        builder
+            .commit_sent(range)
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("commit sent: {e}"),
+            })?;
+    }
+    for range in recv {
+        builder
+            .commit_recv(range)
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("commit recv: {e}"),
+            })?;
+    }
+    builder.build().map_err(|e| Error::MpcTlsFailed {
+        detail: format!("transcript commit config: {e}"),
+    })
 }
 
 /// Extract TLS handshake data from a TLS transcript.
@@ -561,26 +603,11 @@ where
 
         let notary_sent_ranges = sent_layout.reveal.clone();
 
-        let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-        let (sent_commits, recv_commits) =
-            (sent_layout.commit.clone(), recv_layout.commit.clone());
-        for range in sent_commits {
-            tc_builder
-                .commit_sent(&range)
-                .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("commit sent: {e}"),
-                })?;
-        }
-        for range in recv_commits {
-            tc_builder
-                .commit_recv(&range)
-                .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("commit recv: {e}"),
-                })?;
-        }
-        let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
-            detail: format!("transcript commit config: {e}"),
-        })?;
+        let transcript_commit = transcript_commit_config(
+            &transcript,
+            &sent_layout.commit,
+            &recv_layout.commit,
+        )?;
 
         let mut prove_config = ProveConfig::builder(&transcript);
         prove_config.server_identity();
@@ -679,7 +706,7 @@ where
             })
             .collect::<Result<_>>()?;
         // The request itself goes nowhere: the notary answers a session with the
-        // section 9.1 record and reads no attestation request. `build` is still
+        // attested-data record and reads no attestation request. `build` is still
         // what produces `secrets`, so it stays.
         let (_att_request, secrets) = req_builder
             .build(&CryptoProvider::default())
@@ -881,6 +908,38 @@ mod tests {
             .header("Host", "www.googleapis.com")
             .body(())
             .expect("valid request")
+    }
+
+    /// REQ-COMMON-38: launch profiles pin SHA-256, because the Proving
+    /// Circuit computes SHA-256 and cannot open a commitment made under
+    /// anything else.
+    ///
+    /// This is asserted on the CONFIG rather than on a notarized session,
+    /// because the algorithm is chosen here and nowhere else -- `select_layout`
+    /// hands back ranges, so no caller can correct it. The unit tests that
+    /// cover the record synthesize their own commitments and hard-code
+    /// SHA-256, so they assert on an algorithm no code path in this crate
+    /// produces; this is the gap that leaves.
+    #[test]
+    fn every_commitment_this_prover_configures_is_sha256() {
+        let transcript =
+            Transcript::new(b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nx");
+        // Two ranges per direction: the algorithm is per commitment, so one
+        // range could not tell a default applied once from one applied to each.
+        let config =
+            transcript_commit_config(&transcript, &[0..4, 6..10], &[0..4, 6..10])
+                .expect("the ranges are inside the transcript");
+
+        let algs: Vec<_> = config.iter_hash().map(|(_, alg)| *alg).collect();
+        assert_eq!(algs.len(), 4, "two commitments per direction");
+        for alg in algs {
+            assert_eq!(
+                alg,
+                HashAlgId::SHA256,
+                "a commitment under {alg:?} is one the circuit cannot open, and \
+                 one `AttestedData::from_observed` refuses (REQ-COMMON-38)"
+            );
+        }
     }
 
     #[test]
