@@ -22,6 +22,7 @@ use std::ops::Range;
 use crate::ranges::{
     compute_field_snippet_range,
     compute_id_snippet_range,
+    compute_json_member,
 };
 
 /// What one direction of one session discloses.
@@ -120,7 +121,14 @@ pub fn token_request(
 /// committed range is indistinguishable from a `refresh_token` value, or any
 /// other substring the prover chose to commit (REQ-PLAT-57, REQ-PLAT-58).
 pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
-    const ANCHOR_LEN: usize = r#""access_token":""#.len();
+    // Named once, and a constant rather than a parameter. `access_token` is
+    // RFC 6749 section 5.1, not a platform's choice -- which is why the
+    // contract pins `ACCESS_TOKEN_PREFIX` on `TlsNotaryVerifierBase`, shared by
+    // every profile, while the things that ARE platform choices are per-profile
+    // virtuals there and parameters here: the committed body credential of
+    // `token_request`, the field names of `identity_response`.
+    const FIELD: &str = "access_token";
+    let missing = || LayoutError::MissingField(FIELD.into());
 
     // Through the shared reader rather than a scan of its own. That one locates
     // the response BODY, so a header carrying this delimiter cannot answer
@@ -128,28 +136,24 @@ pub fn token_response(recv: &[u8]) -> Result<Layout, LayoutError> {
     // this direction cares about most, because the framing would land inside
     // the committed bearer and the circuit would open a value the token service
     // never returned.
-    let member = compute_field_snippet_range(recv, "access_token")
-        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
+    let found = compute_json_member(recv, FIELD).ok_or_else(missing)?;
 
-    // The member is `"access_token":"<bearer>"`. Reveal the two delimiters; the
-    // complement commits the bearer between them.
-    let value_start = member
-        .start
-        .checked_add(ANCHOR_LEN)
-        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
-    let close = member
-        .end
-        .checked_sub(1)
-        .ok_or_else(|| LayoutError::MissingField("access_token".into()))?;
-    // An empty bearer would leave the two reveals adjacent and commit nothing,
-    // and a response direction with no commitment is one the framing check on
-    // chain finds no bearer in.
-    if close <= value_start {
-        return Err(LayoutError::MissingField("access_token".into()));
+    // Reveal the two delimiters and let the complement commit the bearer
+    // between them. Both boundaries come from the scan that found the member,
+    // so nothing here restates `"access_token":"` to recompute one.
+    //
+    // An empty bearer is refused: it would leave the two reveals adjacent and
+    // commit nothing, and a response direction with no commitment is one the
+    // framing check on chain finds no bearer in.
+    if found.value.is_empty() {
+        return Err(missing());
     }
 
     Ok(layout(
-        vec![member.start..value_start, close..member.end],
+        vec![
+            found.member.start..found.value.start,
+            found.value.end..found.member.end,
+        ],
         recv.len(),
     ))
 }

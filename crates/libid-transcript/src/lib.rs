@@ -24,6 +24,7 @@ pub use ranges::{
     compute_field_snippet_range,
     compute_id_snippet_range,
     compute_id_snippet_range_after,
+    compute_json_member,
     extract_header,
     extract_response_body,
     find_header_range,
@@ -34,6 +35,7 @@ pub use ranges::{
     find_presentation_commit_ranges,
     find_request_line_range,
     find_response_body_range,
+    JsonMember,
 };
 pub use types::TlsHandshakeData;
 pub use wire::{

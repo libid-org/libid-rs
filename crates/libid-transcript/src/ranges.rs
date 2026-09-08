@@ -222,6 +222,25 @@ pub fn compute_field_reveal_range(recv: &[u8], field_name: &str) -> Option<Range
 /// honest prover from building that layout; a dishonest one does not run this
 /// code at all.
 pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
+    json_member_in(body, field).map(|member| member.member)
+}
+
+/// A `"field":"value"` member, and the value inside it.
+///
+/// Two ranges rather than one because a caller that reveals the delimiters and
+/// commits the value needs both boundaries, and deriving the inner one from the
+/// outer one means restating the template -- which is a second place to change
+/// the field name and one place to forget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonMember {
+    /// The whole member, both delimiters included.
+    pub member: Range<usize>,
+    /// The value alone, between the quotes. Empty when the value is `""`.
+    pub value: Range<usize>,
+}
+
+/// Locate the member and its value in one pass over `body`.
+fn json_member_in(body: &[u8], field: &str) -> Option<JsonMember> {
     let needle = format!("\"{field}\":\"");
     let start = find_first(body, needle.as_bytes())?;
     let value = start.checked_add(needle.len())?;
@@ -230,8 +249,11 @@ pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>>
         .iter()
         .position(|&b| b == b'"')?
         .checked_add(value)?;
-    // From the opening `"` of the key through the closing `"` of the value.
-    Some(start..close.checked_add(1)?)
+    Some(JsonMember {
+        // From the opening `"` of the key through the closing `"` of the value.
+        member: start..close.checked_add(1)?,
+        value: value..close,
+    })
 }
 
 /// The first occurrence of `needle`, or nothing.
@@ -288,22 +310,33 @@ pub fn compute_field_snippet_range(
     recv: &[u8],
     field_name: &str,
 ) -> Option<Range<usize>> {
+    compute_json_member(recv, field_name).map(|found| found.member)
+}
+
+/// [`compute_field_snippet_range`], keeping the value boundary too.
+///
+/// For a caller that reveals a member's delimiters and commits what sits
+/// between them: the boundaries come from the scan that found them, so no
+/// caller restates the template to recover one.
+pub fn compute_json_member(recv: &[u8], field_name: &str) -> Option<JsonMember> {
     let body_range = find_response_body_range(recv)?;
     let raw_body = &recv[body_range.clone()];
     let decoded_body = extract_response_body(recv).ok()?;
 
     // Found in both: the decoded body says the member exists, the raw body says
     // where it sits, and the two must hold the same bytes.
-    let decoded_range = find_json_snippet_range(&decoded_body, field_name)?;
-    let raw_snippet_range = find_json_snippet_range(raw_body, field_name)?;
+    let decoded = json_member_in(&decoded_body, field_name)?;
+    let raw = json_member_in(raw_body, field_name)?;
     require_contiguous(
-        raw_body.get(raw_snippet_range.clone())?,
-        decoded_body.get(decoded_range)?,
+        raw_body.get(raw.member.clone())?,
+        decoded_body.get(decoded.member)?,
     )?;
 
-    let start = body_range.start.checked_add(raw_snippet_range.start)?;
-    let end = body_range.start.checked_add(raw_snippet_range.end)?;
-    Some(start..end)
+    let at = |offset: usize| body_range.start.checked_add(offset);
+    Some(JsonMember {
+        member: at(raw.member.start)?..at(raw.member.end)?,
+        value: at(raw.value.start)?..at(raw.value.end)?,
+    })
 }
 
 /// Like [`compute_id_snippet_range`] but only matches `field_name` after the
