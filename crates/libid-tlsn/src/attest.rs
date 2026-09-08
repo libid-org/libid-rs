@@ -6,9 +6,9 @@
 //! this crate owns the translation and is git-only because tlsn is. Nothing
 //! above needs to know that a `RangeSet` exists.
 //!
-//! The `REQ-COMMON-56`/`-57`/`-59`/`-61` cited below are from libid PR #12,
-//! which was closed without merging. `libid_ceremony::attestation` carries the
-//! provenance note and states each rule in full.
+//! The byte layout itself is the profile's rather than the specification's;
+//! `libid_ceremony::attestation` says under which requirement, and states each
+//! rule it keeps in full.
 
 use libid_ceremony::attestation::{
     tag,
@@ -30,9 +30,11 @@ use tlsn::{
 pub struct AttestationInput {
     /// The notary's OWN clock reading when the session completed.
     ///
-    /// REQ-COMMON-57 forbids taking this from the prover, from a response
-    /// header, or from any other party. It is an argument rather than a call to
-    /// the clock here so a test can pin it; the caller must pass its own.
+    /// Never the prover's, never a response header, never any other party's:
+    /// the verifier's freshness window is measured from this, so a reading the
+    /// observed party could choose would be a window it could choose. It is an
+    /// argument rather than a call to the clock here so a test can pin it; the
+    /// caller must pass its own.
     pub created_at: u64,
 }
 
@@ -58,7 +60,7 @@ fn u32_of(value: usize) -> Result<u32, AttestError> {
 ///
 /// The notary places nothing here that it derived by applying a profile rule --
 /// no handle, no account identifier, no client identifier, no chain address
-/// (REQ-COMMON-61). Every such value is already derivable from the revealed
+/// (REQ-COMMON-33). Every such value is already derivable from the revealed
 /// ranges, a second signed copy can disagree with the bytes it came from, and
 /// producing one would make the Notary Service decide something
 /// profile-specific.
@@ -77,7 +79,8 @@ pub fn attested_data(
         // name the notary authenticated, with no trailing dot. It is a signed
         // field rather than a transcript range because the transcript carries
         // the authority only in a prover-composed `Host` header, which says
-        // nothing about which server answered (REQ-COMMON-21, REQ-COMMON-56).
+        // nothing about which server answered (REQ-COMMON-21,
+        // REQ-COMMON-21A).
         authority_id: tag(&authority.to_ascii_lowercase()),
         created_at: input.created_at,
         sent_transcript_length: u32_of(partial.len_sent())?,
@@ -100,8 +103,8 @@ fn direction_block(
     // One entry per revealed range, in ascending start order, each carrying
     // where it sat and what it held. Revealed bytes signed without their
     // offsets say that some bytes were disclosed but not where they sat, which
-    // is not enough to tile a transcript (REQ-COMMON-59). The end is the
-    // bytes' own length, so it is not written down twice.
+    // is not enough to tile a transcript. The end is the bytes' own length, so
+    // it is not written down twice.
     let mut revealed = Vec::new();
     for range in authed.iter() {
         // Still checked, even though only `start` is encoded: a range whose end
@@ -309,9 +312,10 @@ mod tests {
 
     #[test]
     fn places_no_profile_derived_value_in_the_signed_bytes() {
-        // REQ-COMMON-61: the notary must place no value it obtained by
-        // applying a profile rule -- no handle, no account identifier, no
-        // client identifier, no chain address. Every one is already derivable
+        // REQ-COMMON-33: the Notary Service decides nothing profile-specific,
+        // so the notary places no value it obtained by applying a profile rule
+        // -- no handle, no account identifier, no client identifier, no chain
+        // address. Every one is already derivable
         // from the revealed ranges, and a second signed representation can
         // disagree with the bytes it was taken from.
         //

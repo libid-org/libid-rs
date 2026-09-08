@@ -1,30 +1,20 @@
-//! The attestation format of ceremony-common section 9.1.
+//! The attested-data format the launch profiles pin.
+//!
+//! THE LAYOUT IS THE PROFILE'S, NOT THE SPECIFICATION'S. `REQ-COMMON-18` has a
+//! Platform Profile fix the attestation format it accepts and leaves the format
+//! itself to the profile author. So this module is the definition, not a
+//! reading of one, and every rule it keeps is stated here in full.
 //!
 //! An attestation is a byte string and a signature over it. The Notary Service
 //! signs off chain, where it holds the transcript, and verifies on chain, where
 //! it holds none. The verifying side therefore rebuilds these exact bytes from
 //! what it was handed and derives the signing key from them: a field reordered,
-//! omitted, or encoded differently on either side derives a key nobody trusts
-//! (REQ-COMMON-47).
+//! omitted, or encoded differently on either side derives a key nobody trusts,
+//! and `REQ-COMMON-33` leaves it nothing else to check the signature against.
 //!
 //! Every boundary is derivable from bytes that precede it, so decoding is one
 //! forward pass and two different attestations cannot share one preimage by
-//! shifting a boundary (REQ-COMMON-48).
-//!
-//! # Where these requirement numbers come from
-//!
-//! The `REQ-COMMON-47` through `REQ-COMMON-61` cited below are NOT in the
-//! published specification. They were written in libid PR #12, which defined
-//! this byte layout and was closed on 2026-08-20 without merging; PR #15 does
-//! not restore it. What survives on main is `REQ-COMMON-18`, which requires a
-//! Platform Profile to PIN the attestation format it accepts and leaves the
-//! format itself to the profile author.
-//!
-//! So this module is the definition, not a reading of one. The numbering is
-//! kept because it is the specification's own, and the intent is to upstream
-//! this layout under those identifiers -- the specification follows what the
-//! implementation needs. Until it does, a reader looking these up will not
-//! find them, and every rule they name is stated in full here.
+//! shifting a boundary.
 //!
 //! Four components must agree on these bytes: this crate, the Solidity
 //! decoder, the TypeScript mirror, and the notary that signs them. A
@@ -45,8 +35,7 @@ pub struct RevealedRange {
 }
 
 /// A hidden range, carried as its offsets and a blinded commitment. The
-/// plaintext of a committed range never appears in the attested data
-/// (REQ-COMMON-60).
+/// plaintext of a committed range never appears in the attested data.
 #[derive(Clone, Debug, PartialEq, Eq, bincode::Encode)]
 pub struct RangeCommitment {
     pub start: u32,
@@ -88,7 +77,8 @@ pub struct AttestedData {
 /// two transcript lengths.
 pub const HEADER_LEN: usize = 32 + 8 + 4 + 4;
 
-/// Hash the canonical authority bytes into `authorityId` (REQ-COMMON-56).
+/// Hash the canonical authority bytes into `authorityId` (REQ-COMMON-21,
+/// REQ-COMMON-21A).
 ///
 /// The record's one remaining 32-byte tag. It used to serve three more --
 /// format, platform and session -- and those went with the fields the notary
@@ -124,7 +114,7 @@ impl AttestedData {
     }
 
     /// What the notary signs, and the only preimage it ever signs
-    /// (REQ-COMMON-47).
+    /// (REQ-COMMON-33).
     pub fn digest(&self) -> Result<[u8; 32], bincode::error::EncodeError> {
         Ok(keccak256(&self.encode()?))
     }
