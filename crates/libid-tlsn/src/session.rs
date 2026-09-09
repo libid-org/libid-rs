@@ -7,7 +7,13 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use libid_transcript::ceremony::Layout;
-use std::future::IntoFuture;
+use std::{
+    future::IntoFuture,
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
+};
 use tlsn::{
     attestation::{
         request::{
@@ -292,8 +298,10 @@ pub struct ProverResult<T> {
     pub response_body: Vec<u8>,
     /// The TLS secrets for proof construction.
     pub secrets: Secrets,
-    /// One opening per commitment this session made, in the order the layouts
-    /// stated them. Empty when the session committed nothing.
+    /// One opening per commitment this session made, in no particular order:
+    /// tlsn hands the commitments back from a set, so a caller finds its
+    /// opening by the `ranges` it covers rather than by position. Empty when
+    /// the session committed nothing.
     pub commitment_openings: Vec<CommitmentOpening>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
@@ -407,6 +415,11 @@ where
     // dropping this future — aborts the driver instead of detaching it.
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // Set once the session has run. Before that, the driver finishing means the
+    // connection died under the session; after, it means the peer closed the
+    // mux, which is how a session ends.
+    let established = AtomicBool::new(false);
+    let established = &established;
     let setup = async {
         info!("Setting up MPC-TLS");
         let prover = handle
@@ -555,6 +568,7 @@ where
                 detail: format!("prove: {e}"),
             })?;
         info!("MPC-TLS proof complete");
+        established.store(true, Ordering::Release);
         on_progress(ProverStep::MpcProofFinalized);
 
         let tls_transcript = prover.tls_transcript().clone();
@@ -646,17 +660,28 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
+    let mut finished_driver = None;
     let (body, secrets, commitment_openings) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+            if !established.load(Ordering::Acquire) {
+                return Err(driver_finished_early(driver_res));
+            }
+            // The peer closed the mux as its last act while this side was
+            // still finishing. Let setup complete and keep the driver's
+            // result: a finished handle cannot be polled a second time. Not a
+            // `select!` precondition, which is evaluated once, on entry.
+            finished_driver = Some(driver_res);
+            (&mut setup).await?
         }
     };
 
-    let recovered_compat: Compat<T> = driver_task
-        .into_inner()
-        .await
+    let driver_res = match finished_driver {
+        Some(res) => res,
+        None => driver_task.into_inner().await,
+    };
+    let recovered_compat: Compat<T> = driver_res
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),
         })?
@@ -684,6 +709,11 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
     // dropping this future — aborts the driver instead of detaching it.
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // Set once the session has run. Before that, the driver finishing means the
+    // connection died under the session; after, it means the peer closed the
+    // mux, which is how a session ends.
+    let established = AtomicBool::new(false);
+    let established = &established;
     let setup = async {
         let verifier = handle
             .new_verifier(
@@ -731,6 +761,7 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
         let verifier = verifier.run().await.map_err(|e| Error::MpcTlsFailed {
             detail: format!("run: {e}"),
         })?;
+        established.store(true, Ordering::Release);
 
         let tls_transcript = verifier.tls_transcript().clone();
 
@@ -817,17 +848,28 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
     // connection died under the session (e.g. a health probe that connected
     // and immediately closed) — a protocol request already submitted to it
     // may then never resolve, so fail instead of pending forever.
+    let mut finished_driver = None;
     let (server_name, transcript, tls_transcript, transcript_commitments) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+            if !established.load(Ordering::Acquire) {
+                return Err(driver_finished_early(driver_res));
+            }
+            // The peer closed the mux as its last act while this side was
+            // still finishing. Let setup complete and keep the driver's
+            // result: a finished handle cannot be polled a second time. Not a
+            // `select!` precondition, which is evaluated once, on entry.
+            finished_driver = Some(driver_res);
+            (&mut setup).await?
         }
     };
 
-    let recovered_compat: Compat<T> = driver_task
-        .into_inner()
-        .await
+    let driver_res = match finished_driver {
+        Some(res) => res,
+        None => driver_task.into_inner().await,
+    };
+    let recovered_compat: Compat<T> = driver_res
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),
         })?
