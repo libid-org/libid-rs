@@ -333,7 +333,7 @@ mod tests {
     /// Reveal everything except the bearer, and commit the bearer -- the shape
     /// an identity session actually produces.
     fn session() -> (PartialTranscript, Vec<TranscriptCommitment>) {
-        let bearer = 45..48; // "TOK"
+        let bearer = 48..51; // "TOK"
         let transcript = Transcript::new(SENT, RECV);
         let sent_revealed = RangeSet::from(vec![0..bearer.start, bearer.end..SENT.len()]);
         let partial = transcript.to_partial(sent_revealed, RangeSet::from(0..RECV.len()));
@@ -383,6 +383,44 @@ mod tests {
         let (partial, commitments) = session();
         let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
         assert_tiles(&data.sent, data.sent_transcript_length);
+    }
+
+    /// The fixture's own offsets, which nothing else here reads.
+    ///
+    /// Every other test built on `session()` asserts tiling, the signed
+    /// lengths, the authority or the clock -- all of which hold just as well
+    /// when the committed range is the wrong three bytes. They WERE the wrong
+    /// three bytes: `45..48` is `er `, the tail of the header name, so the
+    /// fixture committed part of `authorization: Bearer` and revealed `TOK`,
+    /// while its comment claimed the opposite. A fixture that reveals the
+    /// credential is not the shape an identity session produces, and the
+    /// tests that lean on it were describing a session no prover should run.
+    #[test]
+    fn the_fixture_commits_the_credential_and_reveals_none_of_it() {
+        let (partial, commitments) = session();
+        let data = AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
+
+        let token = SENT
+            .windows(3)
+            .position(|w| w == b"TOK")
+            .expect("the fixture request carries a bearer");
+
+        let [committed] = data.sent.commitments.as_slice() else {
+            panic!("an identity request commits exactly one range, the credential")
+        };
+        assert_eq!(
+            (committed.start as usize, committed.end as usize),
+            (token, token + 3),
+            "the committed range must be the credential, not the bytes beside it"
+        );
+
+        for range in &data.sent.revealed {
+            let start = range.start as usize;
+            assert!(
+                start + range.bytes.len() <= token || start >= token + 3,
+                "a revealed range covers the credential this session is meant to hide"
+            );
+        }
     }
 
     #[test]
@@ -501,7 +539,7 @@ mod tests {
             "the two responses must be the same length"
         );
 
-        let bearer = 45..48;
+        let bearer = 48..51;
         let sent_revealed = RangeSet::from(vec![0..bearer.start, bearer.end..SENT.len()]);
         let commitments = vec![TranscriptCommitment::Hash(PlaintextHash {
             direction: Direction::Sent,
@@ -515,7 +553,10 @@ mod tests {
                 .to_partial(sent_revealed.clone(), RangeSet::from(0..recv.len()));
             let data =
                 AttestedData::from_observed(observed(&partial, &commitments)).unwrap();
-            headers.push(data.encode().unwrap()[..144].to_vec());
+            headers.push(
+                data.encode().unwrap()[..libid_ceremony::attestation::HEADER_LEN]
+                    .to_vec(),
+            );
         }
         assert_eq!(
             headers[0], headers[1],
