@@ -62,5 +62,4 @@ tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
-# TS bindings codegen — opt-in via the `ts` feature of libid-transcript.
 webpki-root-certs = "1.0"
