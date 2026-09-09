@@ -38,11 +38,11 @@ bincode = { version = "=2.0.1", features = ["derive"] }
 hex = "0.4"
 # The ceremony profiles, generated in libid-contracts from the same
 # `profiles.json` its verifiers read. Zero dependencies of its own.
-libid-profiles = "0.8"
+libid-profiles = "0.9"
 # The generated handle table, for the test that keeps the platform names of
 # the ceremony profiles and the identity system from drifting apart. A
 # dev-dependency only: nothing published carries it.
-libid-identity = "0.8"
+libid-identity = "0.9"
 # Chunk-size parsing. Hand-rolling it is how a malformed chunk becomes a short
 # body instead of an error.
 httparse = "1"
