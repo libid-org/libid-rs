@@ -250,8 +250,8 @@ fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
 /// trailing `,` that follows the number (matching the on-chain `idSuffix=,`).
 ///
 /// Returns `None` only when neither a `,` nor a `}` terminator follows the
-/// number; both terminators are included in the range (on-chain `_extractId`
-/// scans digits and stops at either).
+/// number; both terminators are included in the range (on-chain
+/// `tryJsonInteger` scans digits and stops at either).
 pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
     let needle = format!("\"{field}\":");
     let start = find_first(body, needle.as_bytes())?;
@@ -299,7 +299,7 @@ pub fn compute_field_snippet_range(
 /// quotedness: `quoted` → `"id":"<id>"`, otherwise the bare `"id":<n>[,}]` form.
 ///
 /// Returns `None` if the field is absent. Both `,`- and `}`-terminated bare
-/// numbers are matched (on-chain `_extractId` scans digits past either).
+/// numbers are matched (on-chain `tryJsonInteger` scans digits past either).
 pub fn compute_id_snippet_range(
     recv: &[u8],
     field_name: &str,

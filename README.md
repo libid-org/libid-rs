@@ -2,8 +2,8 @@
 
 Shared Rust crates for MPC-TLS / zkTLS infrastructure: run TLSNotary-style
 notarization sessions, carve selective-disclosure ranges out of TLS
-transcripts, build the Merkle/EIP-191 proof material, and produce the exact
-digests the libID on-chain verifiers check.
+transcripts, sign the EIP-191 material, and produce the exact attested-data
+record the libID on-chain verifiers check.
 
 ## Crates
 
@@ -44,28 +44,44 @@ let result = libid_tlsn::verifier(socket).await?;
 libid_transcript::write_msg(&mut result.recovered_io, &response).await?;
 ```
 
-A prover connects to a notary and fetches an authenticated endpoint,
-revealing only the chosen JSON snippets:
+A prover connects to a notary, sends one request inside MPC-TLS, and decides
+what of the exchange is revealed and what is committed. For a launch profile
+that decision is `libid_transcript::ceremony`'s, built from the profile table
+`libid-contracts` generates, so the prover and the on-chain verifier read one
+definition:
 
 ```rust,ignore
-let out = libid_tlsn::prover(
+use libid_tlsn::{Bytes, HttpBody, HttpRequest};
+use libid_transcript::ceremony::{profiles, Layout};
+
+let x = profiles::X.identity.expect("x notarizes an identity session");
+let request = HttpRequest::builder()
+    .method(x.session.method)
+    .uri(format!("https://{}{}", x.session.authority, x.session.path))
+    .header("authorization", format!("Bearer {access_token}"))
+    .header("accept", "application/json")
+    .header("host", x.session.authority)
+    .header("connection", "close")
+    .body(HttpBody::new(Bytes::new()))?;
+
+let out = libid_tlsn::prover_generic(
     socket,
-    access_token,
-    &libid_tlsn::UserInfoParams {
-        api_host: "api.x.com",
-        user_info_path: "/2/users/me",
-        username_field: "username",
-        id_field: Some(("id", true)),
-        user_agent: "my-prover/1.0",
+    request,
+    |sent, recv| {
+        let layouts = Layout::identity_request(sent)
+            .and_then(|s| Layout::identity_response(recv, &x).map(|r| (s, r)));
+        layouts.map_err(|e| libid_tlsn::Error::MpcTlsFailed { detail: e.to_string() })
     },
     |step| tracing::info!(?step),
 )
 .await?;
+// out.response_body, out.secrets, out.commitment_openings, out.recovered_io
 ```
 
-Unauthenticated full-reveal flows (e.g. notarizing a JWKS endpoint) use
-`prover_generic` with `bearer_token: None` and a closure returning
-`vec![0..recv.len()]`.
+The URI is absolute because the host names the server; the wire carries the
+origin-form request line the verifiers pin. A session that reads a public
+document and reveals all of it -- notarizing a JWKS endpoint --
+states its own layouts, revealing the whole of each direction.
 
 ## Versioning and releases
 
