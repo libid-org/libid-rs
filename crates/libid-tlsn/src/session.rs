@@ -32,8 +32,10 @@ use tlsn::{
     hash::HashAlgId,
     prover::ProverOutput,
     transcript::{
+        ContentType,
         Direction,
         PartialTranscript,
+        Record,
         TlsTranscript,
         Transcript,
         TranscriptCommitConfig,
@@ -143,6 +145,49 @@ pub fn root_store() -> RootCertStore {
             .map(|c| CertificateDer(c.to_vec()))
             .collect(),
     }
+}
+
+/// The application data one direction of a finished session actually carried.
+///
+/// The same sum the verifier makes to decide a transcript's true length, taken
+/// here so a commitment can be measured against it before anything allocates
+/// over it.
+fn application_data_len(records: &[Record]) -> usize {
+    records
+        .iter()
+        .filter(|record| record.typ == ContentType::ApplicationData)
+        .map(|record| record.ciphertext.len())
+        .sum()
+}
+
+/// The first committed range that runs past the direction it names, if any.
+///
+/// A prover states its commitments as bare offsets, and NOTHING upstream
+/// bounds them against the session: `TranscriptCommitConfigBuilder` refuses an
+/// out-of-range commitment, but `ProveRequest` derives its deserializer with no
+/// validation, so a prover that writes its own wire bytes never runs that
+/// check. On this side each committed range is allocated over and then used to
+/// index the transcript's plaintext, so an oversized range is an allocation the
+/// session never justified and an out-of-range one indexes past the end.
+///
+/// Separate from the session so it can be tested without one: the shapes worth
+/// testing are all a prover's arithmetic, not a notarization.
+/// Each commitment is given as its direction and the end of the range it
+/// covers, which is the only part of it that can run past the session; an
+/// empty range set has no end and cannot.
+fn commitment_past_the_session(
+    commitments: impl IntoIterator<Item = (Direction, Option<usize>)>,
+    sent_len: usize,
+    recv_len: usize,
+) -> Option<(Direction, usize, usize)> {
+    commitments.into_iter().find_map(|(direction, end)| {
+        let len = match direction {
+            Direction::Sent => sent_len,
+            Direction::Received => recv_len,
+        };
+        end.filter(|end| *end > len)
+            .map(|end| (direction, end, len))
+    })
 }
 
 /// What this session commits to, and under which hash.
@@ -704,6 +749,36 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
             });
         }
 
+        // Refuse a commitment this session cannot contain, BEFORE `accept`
+        // walks it. `accept` allocates in proportion to every committed range
+        // and then indexes the plaintext with it, so a range the prover made
+        // up is either an allocation nothing bounds or an index past the end.
+        // Checked here rather than upstream because this is the last point
+        // that holds both the request and the transcript it describes.
+        let overrun = verifier.request().transcript_commit().and_then(|commit| {
+            commitment_past_the_session(
+                commit
+                    .iter_hash()
+                    .map(|(direction, idx, _)| (*direction, idx.end())),
+                application_data_len(tls_transcript.sent()),
+                application_data_len(tls_transcript.recv()),
+            )
+        });
+        if let Some((direction, end, len)) = overrun {
+            verifier
+                .reject(Some("commitment range out of bounds"))
+                .await
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("reject: {e}"),
+                })?;
+            return Err(Error::MpcTlsFailed {
+                detail: format!(
+                    "a {direction} commitment ends at {end}, past the {len} bytes \
+                     this session carried"
+                ),
+            });
+        }
+
         let (output, verifier) =
             verifier.accept().await.map_err(|e| Error::MpcTlsFailed {
                 detail: format!("accept verify: {e}"),
@@ -812,6 +887,69 @@ mod tests {
                  one `AttestedData::from_observed` refuses (REQ-COMMON-38)"
             );
         }
+    }
+
+    /// A record as a finished session holds it, for the length sum below.
+    fn record(typ: ContentType, len: usize) -> Record {
+        Record {
+            seq: 0,
+            typ,
+            plaintext: None,
+            explicit_nonce: Vec::new(),
+            ciphertext: vec![0; len],
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn the_session_length_counts_only_its_application_data() {
+        // A transcript's offsets are into its application data. Handshake and
+        // alert records ride the same wire and belong to no direction's
+        // offsets, so counting them would leave room for a commitment the
+        // transcript has no bytes for.
+        let records = [
+            record(ContentType::Handshake, 100),
+            record(ContentType::ApplicationData, 40),
+            record(ContentType::Alert, 7),
+            record(ContentType::ApplicationData, 2),
+        ];
+        assert_eq!(application_data_len(&records), 42);
+    }
+
+    #[test]
+    fn a_commitment_past_the_session_is_refused() {
+        // The shape a prover writes by hand. `TranscriptCommitConfigBuilder`
+        // refuses it, and a prover composing its own wire bytes never calls
+        // that builder -- `ProveRequest` deserializes with no validation of
+        // its own, so this is the only place the offsets are met.
+        assert_eq!(
+            commitment_past_the_session([(Direction::Sent, Some(1 << 40))], 4096, 4096),
+            Some((Direction::Sent, 1 << 40, 4096)),
+            "an enormous range is an allocation the session never justified"
+        );
+        assert_eq!(
+            commitment_past_the_session([(Direction::Received, Some(4097))], 4096, 4096),
+            Some((Direction::Received, 4097, 4096)),
+            "one byte past the end still indexes past the plaintext"
+        );
+    }
+
+    #[test]
+    fn a_commitment_the_session_carried_is_allowed() {
+        // Each direction is measured against its OWN length, so a range that
+        // would overrun the other one is still one this session can open.
+        assert_eq!(
+            commitment_past_the_session(
+                [
+                    (Direction::Sent, Some(4096)),
+                    (Direction::Received, Some(30_000)),
+                    (Direction::Sent, None),
+                ],
+                4096,
+                32_768,
+            ),
+            None
+        );
     }
 
     #[test]
