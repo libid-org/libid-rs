@@ -2,18 +2,18 @@
 
 Shared Rust crates for MPC-TLS / zkTLS infrastructure: run TLSNotary-style
 notarization sessions, carve selective-disclosure ranges out of TLS
-transcripts, build the Merkle/EIP-191 proof material, and produce the exact
-digests the libID on-chain verifiers check.
+transcripts, sign the EIP-191 material, and produce the exact attested-data
+record the libID on-chain verifiers check.
 
 ## Crates
 
 | Crate | crates.io | What it is |
 | --- | --- | --- |
-| `libid-crypto` | yes | Contract-agnostic primitives: keccak256, EIP-191 sign/recover (27/28 `v`, low-s), OpenZeppelin-compatible sorted-pair keccak Merkle tree (root, inclusion proofs, verify, double-hashed prefixed leaves), Ethereum address and hex-key helpers. Minimal deps: `k256`, `tiny-keccak`, `hex`. |
-| `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, JSON field and `"key":"value"` snippet ranges, bare-number id snippets, anchored lookups, notary reveal ranges); the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `EvmProof` / `NotaryResponse` / `TlsHandshakeData` types. |
-| `libid-attestations` | yes | Contract-ABI-shaped digest builders, byte-pinned against the Solidity verifiers: chain-bound notary digest, JWKS-rotation notary digest (legacy 6-slot), backend digest, identity hash, and the XZkVerifier token/me attestation digests with their op-tags. |
+| `libid-crypto` | yes | Contract-agnostic primitives: keccak256, EIP-191 sign/recover (27/28 `v`, low-s) — the pair a notary signature is made and checked with — plus address derivation and hex-key parsing. Minimal deps: `k256`, `tiny-keccak`, `hex`. |
+| `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, `"key":"value"` and bare-number member ranges); the per-session ceremony reveal layouts, built from the profile table generated in libid-contracts; the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `AttestationWire` type. |
+| `libid-ceremony` | yes | The attested-data record a notary signs: the types a Platform Profile pins, their big-endian fixed-width encoder, and the keccak256 over it that is the only preimage a notary signs. Also the GitHub Token Service request and response records with the bounds a served call must satisfy. |
 | `libid-signer` | yes | `ManagedSigner` — one signing identity over a local hex key or an AWS KMS key: EIP-191 claim signing (byte-compatible with `libid_crypto::sign_eth_claim`), bare prehash signing (the tlsn `Secp256k1Eth` format), alloy transaction wallets, public-key accessors, and `SignerSource::from_spec` shape-classified key-spec parsing (64-hex → local key, anything else → KMS). |
-| `libid-tlsn` | **no — git only** | The MPC-TLS session driver over the upstream `tlsn` crate: `prover` / `prover_generic` / `verifier` over any async socket, TLS 1.2 handshake-data extraction, WebPKI root store. |
+| `libid-tlsn` | **no — git only** | The MPC-TLS session driver over the upstream `tlsn` crate: `prover_generic` and `verifier` over any async socket, the attested-data record built from what a session was observed to be, WebPKI root store. |
 
 ## The tlsn git-dep caveat
 
@@ -27,16 +27,9 @@ libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 ```
 
 The crate split exists precisely so this caveat stays contained: everything
-that does not need `tlsn` types — range math, wire protocol, proof types,
-digests, signing — is published normally and never drags the git pin into
-your lockfile.
-
-## Feature flags
-
-* `libid-transcript/ts` — derives `ts_rs::TS` on `EvmProof` and
-  `NotaryResponse` for TypeScript bindings generation. Off by default so
-  production builds don't carry `ts-rs`.
-* `libid-tlsn` and everything else: no features.
+that does not need `tlsn` types — range math, reveal layouts, the attested-data
+record, wire protocol, signing — is published normally and never drags the git
+pin into your lockfile.
 
 ## Usage sketch
 
@@ -45,34 +38,50 @@ answers over the same socket:
 
 ```rust,ignore
 let result = libid_tlsn::verifier(socket).await?;
-// inspect result.partial_transcript / result.tls_transcript, build an
-// EvmProof with libid_crypto merkle + libid_attestations digests, sign it
-// with libid_signer::ManagedSigner, then:
+// describe the session as a libid_tlsn::attest::ObservedSession and build
+// the record with AttestedData::from_observed,
+// sign its digest with libid_signer::ManagedSigner, then:
 libid_transcript::write_msg(&mut result.recovered_io, &response).await?;
 ```
 
-A prover connects to a notary and fetches an authenticated endpoint,
-revealing only the chosen JSON snippets:
+A prover connects to a notary, sends one request inside MPC-TLS, and decides
+what of the exchange is revealed and what is committed. For a launch profile
+that decision is `libid_transcript::ceremony`'s, built from the profile table
+`libid-contracts` generates, so the prover and the on-chain verifier read one
+definition:
 
 ```rust,ignore
-let out = libid_tlsn::prover(
+use libid_tlsn::{Bytes, HttpBody, HttpRequest};
+use libid_transcript::ceremony::{profiles, Layout};
+
+let x = profiles::X.identity.expect("x notarizes an identity session");
+let request = HttpRequest::builder()
+    .method(x.session.method)
+    .uri(format!("https://{}{}", x.session.authority, x.session.path))
+    .header("authorization", format!("Bearer {access_token}"))
+    .header("accept", "application/json")
+    .header("host", x.session.authority)
+    .header("connection", "close")
+    .body(HttpBody::new(Bytes::new()))?;
+
+let out = libid_tlsn::prover_generic(
     socket,
-    access_token,
-    &libid_tlsn::UserInfoParams {
-        api_host: "api.x.com",
-        user_info_path: "/2/users/me",
-        username_field: "username",
-        id_field: Some(("id", true)),
-        user_agent: "my-prover/1.0",
+    request,
+    |sent, recv| {
+        let layouts = Layout::identity_request(sent)
+            .and_then(|s| Layout::identity_response(recv, &x).map(|r| (s, r)));
+        layouts.map_err(|e| libid_tlsn::Error::MpcTlsFailed { detail: e.to_string() })
     },
     |step| tracing::info!(?step),
 )
 .await?;
+// out.response_body, out.secrets, out.commitment_openings, out.recovered_io
 ```
 
-Unauthenticated full-reveal flows (e.g. notarizing a JWKS endpoint) use
-`prover_generic` with `bearer_token: None` and a closure returning
-`vec![0..recv.len()]`.
+The URI is absolute because the host names the server; the wire carries the
+origin-form request line the verifiers pin. A session that reads a public
+document and reveals all of it -- notarizing a JWKS endpoint --
+states its own layouts, revealing the whole of each direction.
 
 ## Versioning and releases
 

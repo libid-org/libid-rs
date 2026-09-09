@@ -6,7 +6,14 @@ use hyper::{
     StatusCode,
 };
 use hyper_util::rt::TokioIo;
-use std::future::IntoFuture;
+use libid_transcript::ceremony::Layout;
+use std::{
+    future::IntoFuture,
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
+};
 use tlsn::{
     attestation::{
         request::{
@@ -25,18 +32,22 @@ use tlsn::{
         verifier::VerifierConfig,
     },
     connection::{
-        CertBinding,
-        CertBindingV1_2,
         HandshakeData,
         ServerName,
     },
     hash::HashAlgId,
     prover::ProverOutput,
     transcript::{
+        ContentType,
+        Direction,
         PartialTranscript,
+        Record,
         TlsTranscript,
+        Transcript,
         TranscriptCommitConfig,
         TranscriptCommitment,
+        TranscriptCommitmentKind,
+        TranscriptSecret,
     },
     verifier::{
         VerifierCommitStart,
@@ -68,18 +79,10 @@ use tracing::{
     instrument,
 };
 
-use libid_transcript::{
-    find_notary_reveal_ranges,
-    find_presentation_commit_ranges,
-    TlsHandshakeData,
-};
-
 use crate::{
     Error,
     Result,
 };
-
-use std::ops::Range;
 
 /// Maximum bytes the prover may send in the MPC-TLS session (4 KB). The
 /// verifier rejects sessions configured above this.
@@ -140,19 +143,6 @@ fn driver_finished_early<T, E: std::fmt::Display>(
     Error::MpcTlsFailed { detail }
 }
 
-/// Sub-steps within the MPC-TLS prover phase, reported via callback.
-#[derive(Debug, Clone, Copy)]
-pub enum ProverStep {
-    /// MPC-TLS session established with notary.
-    MpcSetupComplete,
-    /// TLS handshake completed via MPC.
-    TlsHandshakeComplete,
-    /// Platform user data fetched over MPC-TLS.
-    PlatformDataFetched,
-    /// MPC proof finalized.
-    MpcProofFinalized,
-}
-
 /// The WebPKI root store both sides validate server certificates against.
 pub fn root_store() -> RootCertStore {
     RootCertStore {
@@ -163,42 +153,156 @@ pub fn root_store() -> RootCertStore {
     }
 }
 
-/// Extract TLS handshake data from a TLS transcript.
-pub fn extract_handshake_data(
-    tls_transcript: &TlsTranscript,
-) -> Result<TlsHandshakeData> {
-    let CertBinding::V1_2(CertBindingV1_2 {
-        client_random,
-        server_random,
-        server_ephemeral_key,
-    }) = tls_transcript.certificate_binding()
-    else {
-        return Err(Error::UnsupportedTlsVersion {
-            detail: "expected TLS 1.2".into(),
-        });
-    };
+/// The application data one direction of a finished session actually carried.
+///
+/// The same sum the verifier makes to decide a transcript's true length, taken
+/// here so a commitment can be measured against it before anything allocates
+/// over it.
+fn application_data_len(records: &[Record]) -> usize {
+    records
+        .iter()
+        .filter(|record| record.typ == ContentType::ApplicationData)
+        .map(|record| record.ciphertext.len())
+        .sum()
+}
 
-    Ok(TlsHandshakeData {
-        client_random: *client_random,
-        server_random: *server_random,
-        server_ephemeral_key: server_ephemeral_key.key.clone(),
+/// The first committed range that runs past the direction it names, if any.
+///
+/// A prover states its commitments as bare offsets, and NOTHING upstream
+/// bounds them against the session: `TranscriptCommitConfigBuilder` refuses an
+/// out-of-range commitment, but `ProveRequest` derives its deserializer with no
+/// validation, so a prover that writes its own wire bytes never runs that
+/// check. On this side each committed range is allocated over and then used to
+/// index the transcript's plaintext, so an oversized range is an allocation the
+/// session never justified and an out-of-range one indexes past the end.
+///
+/// Separate from the session so it can be tested without one: the shapes worth
+/// testing are all a prover's arithmetic, not a notarization.
+/// Each commitment is given as its direction and the end of the range it
+/// covers, which is the only part of it that can run past the session; an
+/// empty range set has no end and cannot.
+fn commitment_past_the_session(
+    commitments: impl IntoIterator<Item = (Direction, Option<usize>)>,
+    sent_len: usize,
+    recv_len: usize,
+) -> Option<(Direction, usize, usize)> {
+    commitments.into_iter().find_map(|(direction, end)| {
+        let len = match direction {
+            Direction::Sent => sent_len,
+            Direction::Received => recv_len,
+        };
+        end.filter(|end| *end > len)
+            .map(|end| (direction, end, len))
     })
+}
+
+/// What this session commits to, and under which hash.
+///
+/// Split out of `prover_generic` so the algorithm is assertable without an
+/// MPC session: the config is the only place the choice is made, and it is
+/// made here rather than by a caller, because `select_layout` hands back
+/// ranges and no algorithm.
+fn transcript_commit_config(
+    transcript: &Transcript,
+    sent: &[std::ops::Range<usize>],
+    recv: &[std::ops::Range<usize>],
+) -> Result<TranscriptCommitConfig> {
+    let mut builder = TranscriptCommitConfig::builder(transcript);
+    // REQ-COMMON-38. The notarization library defaults to BLAKE3 and the
+    // Proving Circuit computes SHA-256, so a prover left on that default
+    // produces commitments the circuit cannot open -- and which
+    // `AttestedData::from_observed` refuses, after a whole MPC-TLS session has
+    // been paid for. It is set here because `select_layout` hands back ranges
+    // and no algorithm, so no caller can correct it.
+    builder.default_kind(TranscriptCommitmentKind::Hash {
+        alg: HashAlgId::SHA256,
+    });
+    for range in sent {
+        builder
+            .commit_sent(range)
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("commit sent: {e}"),
+            })?;
+    }
+    for range in recv {
+        builder
+            .commit_recv(range)
+            .map_err(|e| Error::MpcTlsFailed {
+                detail: format!("commit recv: {e}"),
+            })?;
+    }
+    builder.build().map_err(|e| Error::MpcTlsFailed {
+        detail: format!("transcript commit config: {e}"),
+    })
+}
+
+/// A phase boundary of a prover session, in the order they occur.
+///
+/// Reported through `on_progress` so a caller can drive something typed off
+/// them -- a progress indicator for a browser waiting out a server-side
+/// exchange, which takes seconds. The same four boundaries are `tracing`
+/// events for operators; this is the interface, because log text is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProverStep {
+    /// MPC-TLS session established with the notary.
+    MpcSetupComplete,
+    /// TLS handshake completed through it.
+    TlsHandshakeComplete,
+    /// The platform answered.
+    PlatformDataFetched,
+    /// The proof is finalised and the session can be closed.
+    MpcProofFinalized,
+}
+
+impl ProverStep {
+    /// How far through the session this boundary is, in `(0, 1]`.
+    ///
+    /// The phases are not equal in wall-clock time -- setup and proving
+    /// dominate -- so this is a position, not an estimate of remaining time.
+    pub fn fraction(self) -> f32 {
+        match self {
+            Self::MpcSetupComplete => 0.25,
+            Self::TlsHandshakeComplete => 0.5,
+            Self::PlatformDataFetched => 0.75,
+            Self::MpcProofFinalized => 1.0,
+        }
+    }
+}
+
+/// The blinder that opens one commitment this session made.
+///
+/// A committed range is a hash of the plaintext and this value, so the party
+/// that later proves something about those bytes needs both. The prover is the
+/// only party that ever holds it: the notary sees the commitment, never the
+/// opening, which is the whole point of committing rather than revealing.
+///
+/// It is surfaced because a caller that commits a credential must hand the
+/// opening on to whoever proves over it — the browser, for a bearer this
+/// service exchanged. Without it the caller holds an attestation nobody can
+/// build a proof against.
+#[derive(Clone)]
+pub struct CommitmentOpening {
+    /// Which direction of the transcript the committed range belongs to.
+    pub direction: Direction,
+    /// The committed ranges, in the same shape the layout stated them, so a
+    /// caller can match an opening against the range it asked to commit
+    /// without converting anything.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// The blinder itself. Sixteen bytes, as the commitment scheme fixes.
+    pub blinder: Vec<u8>,
 }
 
 /// Result from the MPC-TLS prover.
 pub struct ProverResult<T> {
     /// The HTTP response body from the platform API (decoded, headers stripped).
     pub response_body: Vec<u8>,
-    /// Revealed recv segments — the exact bytes the prover disclosed to the notary.
-    /// The notary hashes each segment as `double_hash_leaf("recv:", segment)` to
-    /// build the `recv:` Merkle leaves of the EvmProof. One entry per revealed range.
-    pub recv_segments: Vec<Vec<u8>>,
-    /// The attestation request to send to the notary.
-    pub request: Request,
     /// The TLS secrets for proof construction.
     pub secrets: Secrets,
-    /// Extracted TLS handshake data.
-    pub handshake: TlsHandshakeData,
+    /// One opening per commitment this session made, in no particular order:
+    /// tlsn hands the commitments back from a set, so a caller finds its
+    /// opening by the `ranges` it covers rather than by position. Empty when
+    /// the session committed nothing.
+    pub commitment_openings: Vec<CommitmentOpening>,
     /// The recovered I/O stream after MPC-TLS completes.
     pub recovered_io: T,
 }
@@ -217,119 +321,93 @@ pub struct VerifierResult<T> {
     pub recovered_io: T,
 }
 
-/// The HTTPS request the prover performs over MPC-TLS.
-#[derive(Debug, Clone, Copy)]
-pub struct HttpRequestSpec<'a> {
-    /// API host (SNI and Host header), e.g. `"api.x.com"`.
-    pub api_host: &'a str,
-    /// Request path, e.g. `"/2/users/me"`.
-    pub path: &'a str,
-    /// HTTP method, e.g. `"GET"`.
-    pub method: &'a str,
-    /// Optional request body; when set, `Content-Type: application/json` is
-    /// added.
-    pub body: Option<&'a str>,
-    /// Optional bearer token, sent as `Authorization: Bearer <token>`. `None`
-    /// for unauthenticated endpoints (e.g. a public JWKS fetch).
-    pub bearer_token: Option<&'a str>,
-    /// User-Agent header value.
-    pub user_agent: &'a str,
-}
-
-/// Parameters for the user-info prover flow ([`prover`]).
-#[derive(Debug, Clone, Copy)]
-pub struct UserInfoParams<'a> {
-    /// API host (SNI and Host header).
-    pub api_host: &'a str,
-    /// Path of the user-info endpoint, e.g. `"/2/users/me"`.
-    pub user_info_path: &'a str,
-    /// JSON field holding the handle; its `"field":"value"` snippet is
-    /// revealed.
-    pub username_field: &'a str,
-    /// Optional immutable-id field: `(field_name, quoted)`. Quoted (X):
-    /// `"id":"<id>"`; bare (GitHub): `"id":<n>,`. Revealed when present so
-    /// the backend can build idPath.
-    pub id_field: Option<(&'a str, bool)>,
-    /// User-Agent header value.
-    pub user_agent: &'a str,
-}
-
-/// Run the MPC-TLS prover to fetch user data from a platform API, revealing
-/// the username snippet (and the id snippet when configured).
-#[instrument(skip_all, fields(api_host = params.api_host))]
-pub async fn prover<T, F>(
-    socket: T,
-    access_token: &str,
-    params: &UserInfoParams<'_>,
-    on_progress: F,
-) -> Result<ProverResult<T>>
-where
-    T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
-    F: Fn(ProverStep),
-{
-    let username_field = params.username_field;
-    let id_field = params.id_field;
-    prover_generic(
-        socket,
-        &HttpRequestSpec {
-            api_host: params.api_host,
-            path: params.user_info_path,
-            method: "GET",
-            body: None,
-            bearer_token: Some(access_token),
-            user_agent: params.user_agent,
-        },
-        |recv| {
-            let mut ranges =
-                vec![
-                    libid_transcript::compute_field_snippet_range(recv, username_field)
-                        .ok_or_else(|| Error::MpcTlsFailed {
-                        detail: format!(
-                            "username field '{}' not found in response body",
-                            username_field
-                        ),
-                    })?,
-                ];
-            // Also reveal the immutable id snippet so the backend can build idPath.
-            // Quoted (X): `"id":"<id>"`; bare (GitHub): `"id":<n>,`.
-            if let Some((id_field, quoted)) = id_field {
-                if let Some(range) =
-                    libid_transcript::compute_id_snippet_range(recv, id_field, quoted)
-                {
-                    ranges.push(range);
-                }
-            }
-            Ok(ranges)
-        },
-        on_progress,
-    )
-    .await
+/// Rewrite the request's URI to origin-form before it goes on the wire.
+///
+/// `hyper::client::conn::http1` writes the request-target exactly as the
+/// `Uri` displays (`Client::encode` in `proto/h1/role.rs`); only hyper-util's
+/// pooled client rewrites it, and [`prover_generic`] drives a raw connection.
+/// A caller hands us an absolute URI because that is where the host comes
+/// from, so left alone the request line would read
+/// `GET https://www.googleapis.com/oauth2/v3/certs HTTP/1.1` -- valid HTTP,
+/// but not the origin-form line the Platform Verifiers and `GoogleJwtRoots`
+/// pin, so the session would be refused on chain.
+///
+/// Only the URI changes: the `Host` header the caller set stays as it is.
+fn origin_form<B>(request: &mut hyper::Request<B>) -> Result<()> {
+    let target = match request.uri().path_and_query() {
+        Some(path) => {
+            let mut parts = hyper::http::uri::Parts::default();
+            parts.path_and_query = Some(path.clone());
+            hyper::Uri::from_parts(parts).map_err(|e| Error::MpcTlsFailed {
+                detail: format!("origin-form request-target: {e}"),
+            })?
+        }
+        None => hyper::Uri::default(),
+    };
+    *request.uri_mut() = target;
+    Ok(())
 }
 
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
-/// The `compute_reveal_ranges` closure receives the full `recv` transcript
-/// data after the HTTP exchange completes and must return the byte ranges
-/// within `recv` to selectively disclose. Each range becomes a separate
-/// Merkle leaf in the notary's transcript tree. To reveal the entire
-/// received transcript (as a JWKS-style notary requires), return
-/// `vec![0..recv.len()]`.
+/// `select_layout` receives both complete transcripts once the HTTP exchange
+/// finishes and returns, for each direction, what to reveal and what to commit.
+/// The prover chooses that -- it is the party holding the session keys, and
+/// nobody above it can decide on its behalf.
 ///
-/// Use [`libid_transcript::compute_field_reveal_range`] and friends inside
-/// the closure to locate JSON field values in the response body.
-#[instrument(skip_all, fields(api_host = request.api_host))]
-pub async fn prover_generic<T, F, R>(
+/// A caller producing a ceremony attestation calls
+/// `libid_transcript::ceremony` here and returns what it gives back: those
+/// layouts derive each direction's commitments as the complement of its
+/// reveals, so the direction tiles by construction, which is what the Platform
+/// Verifier's coverage check demands. A caller doing something else -- the
+/// JWKS session reads a public document and reveals all of it -- states its
+/// own.
+///
+/// Each revealed range is carried in the attested record with the offsets it
+/// sat at, and each hidden run as one commitment; `libid_transcript::ceremony`
+/// is what chooses them for a launch profile.
+///
+/// # Following a session
+///
+/// This is slow -- setup and proving dominate -- so every phase boundary is
+/// reported twice, to two different audiences. A `tracing` event inside this
+/// function's span, for whoever reads the logs; and [`ProverStep`] through
+/// `on_progress`, for a caller driving something typed off it.
+///
+/// The browser has its own progress from the tlsn wasm prover and never
+/// reaches this function. The caller this exists for is a server that
+/// notarizes on someone's behalf -- the GitHub Token-Exchange Service, whose
+/// HTTP caller waits out the whole session -- and which cannot report phases
+/// by parsing log lines.
+///
+/// The request's URI must be absolute -- the host names the server -- but the
+/// wire carries the request-target in origin-form (`GET /path?query HTTP/1.1`),
+/// which is the line every verifier pins. See [`origin_form`].
+#[instrument(skip_all)]
+pub async fn prover_generic<T, S, F>(
     socket: T,
-    request: &HttpRequestSpec<'_>,
-    compute_reveal_ranges: R,
+    mut request: hyper::Request<http_body_util::Full<Bytes>>,
+    select_layout: S,
     on_progress: F,
 ) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+    S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
     F: Fn(ProverStep),
-    R: FnOnce(&[u8]) -> Result<Vec<Range<usize>>>,
 {
-    let api_host = request.api_host;
+    // SNI and the TCP peer come from the request's own authority. A caller
+    // that set no host has not said which server it means to reach.
+    let api_host = request
+        .uri()
+        .host()
+        .ok_or_else(|| Error::MpcTlsFailed {
+            detail: "request URI carries no host".into(),
+        })?
+        .to_string();
+    let api_host = api_host.as_str();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    origin_form(&mut request)?;
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -337,6 +415,11 @@ where
     // dropping this future — aborts the driver instead of detaching it.
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // Set once the session has run. Before that, the driver finishing means the
+    // connection died under the session; after, it means the peer closed the
+    // mux, which is how a session ends.
+    let established = AtomicBool::new(false);
+    let established = &established;
     let setup = async {
         info!("Setting up MPC-TLS");
         let prover = handle
@@ -361,6 +444,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("commit: {e}"),
             })?;
+        info!("MPC-TLS setup complete");
         on_progress(ProverStep::MpcSetupComplete);
 
         info!("Connecting to {} API", api_host);
@@ -383,6 +467,7 @@ where
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("connect: {e}"),
             })?;
+        info!("TLS handshake complete");
         on_progress(ProverStep::TlsHandshakeComplete);
 
         let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
@@ -396,41 +481,10 @@ where
         // exchange; the guard reaps it if the session bails out first.
         let _conn_task = AbortOnDrop::new(tokio::spawn(conn));
 
-        let http_request = {
-            let mut builder = hyper::Request::builder()
-                .method(request.method)
-                .uri(request.path)
-                .header("Host", api_host)
-                .header("Connection", "close")
-                .header("Accept", "application/json")
-                .header("User-Agent", request.user_agent);
-            if let Some(token) = request.bearer_token {
-                builder = builder.header("Authorization", format!("Bearer {}", token));
-            }
-            if request.body.is_some() {
-                builder = builder.header("Content-Type", "application/json");
-            }
-            if let Some(post_body) = request.body {
-                builder
-                    .body(http_body_util::Full::new(Bytes::from(
-                        post_body.to_string(),
-                    )))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            } else {
-                builder
-                    .body(http_body_util::Full::new(Bytes::new()))
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("request build: {e}"),
-                    })?
-            }
-        };
-
-        info!("Sending {} {}", request.method, request.path);
+        info!("Sending {method} {path}");
         let response =
             sender
-                .send_request(http_request)
+                .send_request(request)
                 .await
                 .map_err(|e| Error::MpcTlsFailed {
                     detail: format!("send request: {e}"),
@@ -468,34 +522,24 @@ where
         let transcript = prover.transcript().clone();
         let sent = transcript.sent();
         let recv = transcript.received();
-        let reveal_recv_ranges = compute_reveal_ranges(recv)?;
+        // The ceremony layouts derive their commitments as the complement of
+        // the reveals, so each direction tiles by construction -- which is what
+        // the Platform Verifier's coverage check demands.
+        // The prover chooses what it reveals -- that is what a prover IS. One
+        // parameter says so, and there is no second mechanism to disagree with
+        // it. A caller wanting the specification's layouts calls
+        // `libid_transcript::ceremony` here and returns what it gives back.
+        let (sent_layout, recv_layout) = select_layout(sent, recv)?;
 
-        // Save the revealed recv segments BEFORE the transcript is moved.
-        // The notary hashes exactly these bytes into the `recv:` Merkle leaves, so
-        // saving them here lets the ZK prover verify the full chain.
-        let recv_segments: Vec<Vec<u8>> = reveal_recv_ranges
-            .iter()
-            .map(|r| recv[r.clone()].to_vec())
-            .collect();
+        let reveal_recv_ranges = recv_layout.reveal.clone();
 
-        let notary_sent_ranges = find_notary_reveal_ranges(sent);
+        let notary_sent_ranges = sent_layout.reveal.clone();
 
-        let mut tc_builder = TranscriptCommitConfig::builder(&transcript);
-        for range in find_presentation_commit_ranges(sent) {
-            tc_builder
-                .commit_sent(&range)
-                .map_err(|e| Error::MpcTlsFailed {
-                    detail: format!("commit sent: {e}"),
-                })?;
-        }
-        tc_builder
-            .commit_recv(&(0..recv.len()))
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("commit recv: {e}"),
-            })?;
-        let transcript_commit = tc_builder.build().map_err(|e| Error::MpcTlsFailed {
-            detail: format!("transcript commit config: {e}"),
-        })?;
+        let transcript_commit = transcript_commit_config(
+            &transcript,
+            &sent_layout.commit,
+            &recv_layout.commit,
+        )?;
 
         let mut prove_config = ProveConfig::builder(&transcript);
         prove_config.server_identity();
@@ -524,10 +568,10 @@ where
                 detail: format!("prove: {e}"),
             })?;
         info!("MPC-TLS proof complete");
+        established.store(true, Ordering::Release);
         on_progress(ProverStep::MpcProofFinalized);
 
         let tls_transcript = prover.tls_transcript().clone();
-        let handshake = extract_handshake_data(&tls_transcript)?;
 
         let mut req_config = RequestConfig::builder();
         req_config
@@ -566,10 +610,37 @@ where
             })
             .transcript(transcript)
             .transcript_commitments(
-                prover_output.transcript_secrets,
+                prover_output.transcript_secrets.clone(),
                 prover_output.transcript_commitments,
             );
-        let (att_request, secrets) = req_builder
+        // Taken before the secrets move into the request: the builder consumes
+        // them and `Secrets` exposes no accessor, so this is the only point at
+        // which a caller can still be handed what opens its own commitments.
+        //
+        // A secret of a kind this cannot open is refused rather than skipped:
+        // dropping one would hand the caller fewer openings than it made
+        // commitments, and it would find that out later, somewhere the reason
+        // is no longer visible.
+        let commitment_openings: Vec<CommitmentOpening> = prover_output
+            .transcript_secrets
+            .into_iter()
+            .map(|secret| match secret {
+                TranscriptSecret::Hash(hash) => Ok(CommitmentOpening {
+                    direction: hash.direction,
+                    ranges: hash.idx.into_inner(),
+                    blinder: hash.blinder.as_bytes().to_vec(),
+                }),
+                other => Err(Error::MpcTlsFailed {
+                    detail: format!(
+                        "commitment secret of a kind this build cannot open: {other:?}"
+                    ),
+                }),
+            })
+            .collect::<Result<_>>()?;
+        // The request itself goes nowhere: the notary answers a session with the
+        // attested-data record and reads no attestation request. `build` is still
+        // what produces `secrets`, so it stays.
+        let (_att_request, secrets) = req_builder
             .build(&CryptoProvider::default())
             .map_err(|e| Error::MpcTlsFailed {
                 detail: format!("attestation request: {e}"),
@@ -581,7 +652,7 @@ where
         })?;
         handle.close();
 
-        Ok((body, recv_segments, att_request, secrets, handshake))
+        Ok((body, secrets, commitment_openings))
     };
     tokio::pin!(setup);
 
@@ -589,17 +660,28 @@ where
     // connection to the verifier died under the session — a protocol request
     // already submitted to it may then never resolve, so fail instead of
     // pending forever.
-    let (body, recv_segments, att_request, secrets, handshake) = tokio::select! {
+    let mut finished_driver = None;
+    let (body, secrets, commitment_openings) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+            if !established.load(Ordering::Acquire) {
+                return Err(driver_finished_early(driver_res));
+            }
+            // The peer closed the mux as its last act while this side was
+            // still finishing. Let setup complete and keep the driver's
+            // result: a finished handle cannot be polled a second time. Not a
+            // `select!` precondition, which is evaluated once, on entry.
+            finished_driver = Some(driver_res);
+            (&mut setup).await?
         }
     };
 
-    let recovered_compat: Compat<T> = driver_task
-        .into_inner()
-        .await
+    let driver_res = match finished_driver {
+        Some(res) => res,
+        None => driver_task.into_inner().await,
+    };
+    let recovered_compat: Compat<T> = driver_res
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),
         })?
@@ -610,10 +692,8 @@ where
 
     Ok(ProverResult {
         response_body: body.to_vec(),
-        recv_segments,
-        request: att_request,
         secrets,
-        handshake,
+        commitment_openings,
         recovered_io,
     })
 }
@@ -629,6 +709,11 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
     // dropping this future — aborts the driver instead of detaching it.
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // Set once the session has run. Before that, the driver finishing means the
+    // connection died under the session; after, it means the peer closed the
+    // mux, which is how a session ends.
+    let established = AtomicBool::new(false);
+    let established = &established;
     let setup = async {
         let verifier = handle
             .new_verifier(
@@ -676,6 +761,7 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
         let verifier = verifier.run().await.map_err(|e| Error::MpcTlsFailed {
             detail: format!("run: {e}"),
         })?;
+        established.store(true, Ordering::Release);
 
         let tls_transcript = verifier.tls_transcript().clone();
 
@@ -691,6 +777,36 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
                 })?;
             return Err(Error::MpcTlsFailed {
                 detail: "no server identity".into(),
+            });
+        }
+
+        // Refuse a commitment this session cannot contain, BEFORE `accept`
+        // walks it. `accept` allocates in proportion to every committed range
+        // and then indexes the plaintext with it, so a range the prover made
+        // up is either an allocation nothing bounds or an index past the end.
+        // Checked here rather than upstream because this is the last point
+        // that holds both the request and the transcript it describes.
+        let overrun = verifier.request().transcript_commit().and_then(|commit| {
+            commitment_past_the_session(
+                commit
+                    .iter_hash()
+                    .map(|(direction, idx, _)| (*direction, idx.end())),
+                application_data_len(tls_transcript.sent()),
+                application_data_len(tls_transcript.recv()),
+            )
+        });
+        if let Some((direction, end, len)) = overrun {
+            verifier
+                .reject(Some("commitment range out of bounds"))
+                .await
+                .map_err(|e| Error::MpcTlsFailed {
+                    detail: format!("reject: {e}"),
+                })?;
+            return Err(Error::MpcTlsFailed {
+                detail: format!(
+                    "a {direction} commitment ends at {end}, past the {len} bytes \
+                     this session carried"
+                ),
             });
         }
 
@@ -732,17 +848,28 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
     // connection died under the session (e.g. a health probe that connected
     // and immediately closed) — a protocol request already submitted to it
     // may then never resolve, so fail instead of pending forever.
+    let mut finished_driver = None;
     let (server_name, transcript, tls_transcript, transcript_commitments) = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+            if !established.load(Ordering::Acquire) {
+                return Err(driver_finished_early(driver_res));
+            }
+            // The peer closed the mux as its last act while this side was
+            // still finishing. Let setup complete and keep the driver's
+            // result: a finished handle cannot be polled a second time. Not a
+            // `select!` precondition, which is evaluated once, on entry.
+            finished_driver = Some(driver_res);
+            (&mut setup).await?
         }
     };
 
-    let recovered_compat: Compat<T> = driver_task
-        .into_inner()
-        .await
+    let driver_res = match finished_driver {
+        Some(res) => res,
+        None => driver_task.into_inner().await,
+    };
+    let recovered_compat: Compat<T> = driver_res
         .map_err(|e| Error::MpcTlsFailed {
             detail: format!("driver task join: {e}"),
         })?
@@ -758,4 +885,137 @@ pub async fn verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
         transcript_commitments,
         recovered_io,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(uri: &str) -> hyper::Request<()> {
+        hyper::Request::builder()
+            .uri(uri)
+            .header("Host", "www.googleapis.com")
+            .body(())
+            .expect("valid request")
+    }
+
+    /// REQ-COMMON-38: launch profiles pin SHA-256, because the Proving
+    /// Circuit computes SHA-256 and cannot open a commitment made under
+    /// anything else.
+    ///
+    /// This is asserted on the CONFIG rather than on a notarized session,
+    /// because the algorithm is chosen here and nowhere else -- `select_layout`
+    /// hands back ranges, so no caller can correct it. The unit tests that
+    /// cover the record synthesize their own commitments and hard-code
+    /// SHA-256, so they assert on an algorithm no code path in this crate
+    /// produces; this is the gap that leaves.
+    #[test]
+    fn every_commitment_this_prover_configures_is_sha256() {
+        let transcript =
+            Transcript::new(b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nx");
+        // Two ranges per direction: the algorithm is per commitment, so one
+        // range could not tell a default applied once from one applied to each.
+        let config =
+            transcript_commit_config(&transcript, &[0..4, 6..10], &[0..4, 6..10])
+                .expect("the ranges are inside the transcript");
+
+        let algs: Vec<_> = config.iter_hash().map(|(_, alg)| *alg).collect();
+        assert_eq!(algs.len(), 4, "two commitments per direction");
+        for alg in algs {
+            assert_eq!(
+                alg,
+                HashAlgId::SHA256,
+                "a commitment under {alg:?} is one the circuit cannot open, and \
+                 one `AttestedData::from_observed` refuses (REQ-COMMON-38)"
+            );
+        }
+    }
+
+    /// A record as a finished session holds it, for the length sum below.
+    fn record(typ: ContentType, len: usize) -> Record {
+        Record {
+            seq: 0,
+            typ,
+            plaintext: None,
+            explicit_nonce: Vec::new(),
+            ciphertext: vec![0; len],
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn the_session_length_counts_only_its_application_data() {
+        // A transcript's offsets are into its application data. Handshake and
+        // alert records ride the same wire and belong to no direction's
+        // offsets, so counting them would leave room for a commitment the
+        // transcript has no bytes for.
+        let records = [
+            record(ContentType::Handshake, 100),
+            record(ContentType::ApplicationData, 40),
+            record(ContentType::Alert, 7),
+            record(ContentType::ApplicationData, 2),
+        ];
+        assert_eq!(application_data_len(&records), 42);
+    }
+
+    #[test]
+    fn a_commitment_past_the_session_is_refused() {
+        // The shape a prover writes by hand. `TranscriptCommitConfigBuilder`
+        // refuses it, and a prover composing its own wire bytes never calls
+        // that builder -- `ProveRequest` deserializes with no validation of
+        // its own, so this is the only place the offsets are met.
+        assert_eq!(
+            commitment_past_the_session([(Direction::Sent, Some(1 << 40))], 4096, 4096),
+            Some((Direction::Sent, 1 << 40, 4096)),
+            "an enormous range is an allocation the session never justified"
+        );
+        assert_eq!(
+            commitment_past_the_session([(Direction::Received, Some(4097))], 4096, 4096),
+            Some((Direction::Received, 4097, 4096)),
+            "one byte past the end still indexes past the plaintext"
+        );
+    }
+
+    #[test]
+    fn a_commitment_the_session_carried_is_allowed() {
+        // Each direction is measured against its OWN length, so a range that
+        // would overrun the other one is still one this session can open.
+        assert_eq!(
+            commitment_past_the_session(
+                [
+                    (Direction::Sent, Some(4096)),
+                    (Direction::Received, Some(30_000)),
+                    (Direction::Sent, None),
+                ],
+                4096,
+                32_768,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn origin_form_keeps_path_and_query() {
+        let mut request = request("https://www.googleapis.com/p?q=1");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().to_string(), "/p?q=1");
+    }
+
+    #[test]
+    fn origin_form_keeps_a_bare_path() {
+        let mut request = request("https://www.googleapis.com/p");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().to_string(), "/p");
+    }
+
+    #[test]
+    fn origin_form_leaves_the_host_header_alone() {
+        let mut request = request("https://www.googleapis.com/oauth2/v3/certs");
+        origin_form(&mut request).expect("origin-form");
+        assert_eq!(request.uri().host(), None);
+        assert_eq!(
+            request.headers().get("Host").map(|v| v.as_bytes()),
+            Some(&b"www.googleapis.com"[..])
+        );
+    }
 }

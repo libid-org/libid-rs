@@ -8,40 +8,30 @@
 //! * [`ranges`] — HTTP/JSON byte-range math for selective disclosure: locate
 //!   headers, response bodies (chunked or not), and JSON field/snippet ranges
 //!   in a raw TLS transcript, and map them back to absolute transcript
-//!   offsets that become Merkle leaves.
+//!   offsets, which are what a reveal range and a commitment are stated in.
 //! * [`wire`] — the length-prefixed JSON protocol the notary and prover speak
 //!   over the recovered socket after MPC-TLS closes.
-//! * [`types`] — [`EvmProof`], [`NotaryResponse`] and [`TlsHandshakeData`],
-//!   the notary's output as consumed by backends and on-chain verifiers.
 
+pub mod ceremony;
 pub mod ranges;
-pub mod types;
 pub mod wire;
 
 pub use ranges::{
-    compute_field_reveal_range,
     compute_field_snippet_range,
     compute_id_snippet_range,
-    compute_id_snippet_range_after,
     extract_header,
     extract_response_body,
     find_header_range,
     find_json_bare_snippet_range,
-    find_json_field_range,
     find_json_snippet_range,
-    find_notary_reveal_ranges,
-    find_presentation_commit_ranges,
     find_request_line_range,
     find_response_body_range,
-};
-pub use types::{
-    EvmProof,
-    NotaryResponse,
-    TlsHandshakeData,
+    JsonMember,
 };
 pub use wire::{
     read_msg,
     write_msg,
+    AttestationWire,
 };
 
 /// Errors from transcript parsing and the wire protocol.

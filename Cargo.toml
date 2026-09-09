@@ -23,18 +23,29 @@ repository = "https://github.com/libid-org/libid-rs"
 libid-crypto = { path = "crates/libid-crypto", version = "0.3.0" }
 libid-signer = { path = "crates/libid-signer", version = "0.3.0" }
 libid-transcript = { path = "crates/libid-transcript", version = "0.3.0" }
-libid-attestations = { path = "crates/libid-attestations", version = "0.3.0" }
+libid-ceremony = { path = "crates/libid-ceremony", version = "0.3.0" }
 
 alloy = { version = "1", default-features = false }
-alloy-primitives = { version = "1", features = ["serde"] }
-alloy-sol-types = "1"
 # KMS-backed signing. alloy's `signer-aws` feature re-exports
 # `alloy::signers::aws::AwsSigner`, but constructing one needs an
 # `aws_sdk_kms::Client`, so the SDK is a direct dependency too. Both are
 # pinned to the 1.x line so cargo unifies them with whatever alloy resolves.
 aws-config = "1"
 aws-sdk-kms = "1"
+# Pinned exactly: the encoded bytes are a signed preimage, so a layout change
+# in a patch release would change what every notary signs.
+bincode = { version = "=2.0.1", features = ["derive"] }
 hex = "0.4"
+# The ceremony profiles, generated in libid-contracts from the same
+# `profiles.json` its verifiers read. Zero dependencies of its own.
+libid-profiles = "0.9"
+# The generated handle table, for the test that keeps the platform names of
+# the ceremony profiles and the identity system from drifting apart. A
+# dev-dependency only: nothing published carries it.
+libid-identity = "0.9"
+# Chunk-size parsing. Hand-rolling it is how a malformed chunk becomes a short
+# body instead of an error.
+httparse = "1"
 http-body-util = "0.1"
 hyper = { version = "1.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["full"] }
@@ -51,6 +62,4 @@ tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
-# TS bindings codegen — opt-in via the `ts` feature of libid-transcript.
-ts-rs = { version = "10", features = ["serde-compat"] }
 webpki-root-certs = "1.0"
