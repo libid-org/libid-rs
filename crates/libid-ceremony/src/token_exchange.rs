@@ -186,7 +186,9 @@ mod tests {
     fn request() -> TokenRequest {
         TokenRequest {
             code: "abc123".into(),
-            code_verifier: "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1_gIZs5I".into(),
+            // The section 7 conformance vector of ceremony-common, transcribed:
+            // this crate derives nothing, so the value can only be copied.
+            code_verifier: "5teBDl6cz4U77aFweV5PbMhBJ_lEFv6LLNKzqnDI5lo".into(),
         }
     }
 
@@ -250,10 +252,10 @@ mod tests {
     fn refuses_a_verifier_of_the_wrong_length_or_charset() {
         for bad in [
             "short",
-            "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1_gIZs5", // 42
-            "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1_gIZs5II", // 44
-            "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1+gIZs5I", // base64, not base64url
-            "iMSTNh6gQkRnBGlY1c0MUOsD7MCO4G8C7ph1/gIZs5I",
+            "5teBDl6cz4U77aFweV5PbMhBJ_lEFv6LLNKzqnDI5l", // 42
+            "5teBDl6cz4U77aFweV5PbMhBJ_lEFv6LLNKzqnDI5loo", // 44
+            "5teBDl6cz4U77aFweV5PbMhBJ+lEFv6LLNKzqnDI5lo", // base64, not base64url
+            "5teBDl6cz4U77aFweV5PbMhBJ/lEFv6LLNKzqnDI5lo",
         ] {
             let r = TokenRequest {
                 code_verifier: bad.into(),
