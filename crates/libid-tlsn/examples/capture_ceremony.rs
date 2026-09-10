@@ -380,7 +380,7 @@ async fn main() {
                 &sign,
             )
             .await
-            .unwrap_or_else(fail);
+            .unwrap_or_else(|e| fail(e));
             let bearer = bearer_of(&token.response_body);
             eprintln!("token received; running the identity session");
             let identity = notarize(
@@ -404,7 +404,7 @@ async fn main() {
                 &sign,
             )
             .await
-            .unwrap_or_else(fail);
+            .unwrap_or_else(|e| fail(e));
             (
                 session_json("https://api.x.com/2/oauth2/token", &token),
                 session_json("https://api.x.com/2/users/me", &identity),
@@ -445,7 +445,7 @@ async fn main() {
                 &sign,
             )
             .await
-            .unwrap_or_else(fail);
+            .unwrap_or_else(|e| fail(e));
             let bearer = bearer_of(&token.response_body);
             eprintln!("token received; running the identity session");
             // As the browser's `identityRequest` sets them.
@@ -472,7 +472,7 @@ async fn main() {
                 &sign,
             )
             .await
-            .unwrap_or_else(fail);
+            .unwrap_or_else(|e| fail(e));
             (
                 session_json("https://github.com/login/oauth/access_token", &token),
                 session_json("https://api.github.com/user", &identity),
