@@ -47,7 +47,6 @@ use libid_transcript::ceremony::{
     Layout,
 };
 use serde_json::json;
-use sha2::Digest as _;
 use tlsn::{
     config::prove::ProveConfig,
     hash::{
@@ -69,64 +68,12 @@ use tokio::io::{
     AsyncWriteExt,
 };
 
-/// The clock, the notary and the submission the contract suites use.
+#[path = "ceremony/common.rs"]
+mod common;
+use common::*;
+
+/// The clock the contract suites warp to.
 const T0: u64 = 1_770_000_000;
-const NOTARY_KEY: &str =
-    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const CHAIN_ID: u64 = 31337;
-const OPERATION_DOMAIN: &[u8] = b"libid.claim-identity";
-const AUTHORIZATION_NONCE: [u8; 32] = [0x55; 32];
-const CEREMONY_VERSION: u16 = 1;
-/// `abi.encode(address(0xBEEF))`.
-fn transaction_data() -> Vec<u8> {
-    let mut data = vec![0u8; 32];
-    data[30] = 0xBE;
-    data[31] = 0xEF;
-    data
-}
-
-/// The Authorization Digest of ceremony-common section 5, as
-/// `CeremonyAuthorization.digestFor` computes it on the test chain.
-fn authorization_digest() -> [u8; 32] {
-    let mut chain = [0u8; 32];
-    chain[24..].copy_from_slice(&CHAIN_ID.to_be_bytes());
-    let data = transaction_data();
-    let mut preimage = Vec::with_capacity(102 + data.len());
-    preimage.extend_from_slice(&keccak256(OPERATION_DOMAIN));
-    preimage.extend_from_slice(&CEREMONY_VERSION.to_be_bytes());
-    preimage.extend_from_slice(&keccak256(&chain));
-    preimage.extend_from_slice(&AUTHORIZATION_NONCE);
-    preimage.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    preimage.extend_from_slice(&data);
-    keccak256(&preimage)
-}
-
-/// The PKCE verifier of section 7: `BASE64URL_NOPAD(SHA256(digest || nonce))`.
-fn code_verifier() -> String {
-    let mut binding = [0u8; 64];
-    binding[..32].copy_from_slice(&authorization_digest());
-    binding[32..].copy_from_slice(&AUTHORIZATION_NONCE);
-    base64url_nopad(&sha2::Sha256::digest(binding))
-}
-
-fn base64url_nopad(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        let keep = chunk.len() + 1;
-        for i in 0..keep {
-            out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
-        }
-    }
-    out
-}
 
 /// The same rewrite `prover_generic` applies before sending: the wire
 /// carries the request-target in origin-form.
@@ -324,10 +271,6 @@ fn build(
     Record { data, openings }
 }
 
-fn hex0x(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
 fn session_json(
     endpoint: &str,
     sent: &[u8],
@@ -358,22 +301,14 @@ async fn main() {
     let notary = hex0x(&pubkey_to_eth_address(key.verifying_key()));
     let sign = |digest: &[u8; 32]| sign_eth_claim(&key, digest).expect("sign");
     let verifier = code_verifier();
-    let browser_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
     let common = |platform: &str| {
-        json!({
-            "platform": platform,
-            "generator": "libid-rs: cargo run -p libid-tlsn --example ceremony_fixtures -- <dir>",
-            "ceremony_version": CEREMONY_VERSION,
-            "chain_id": CHAIN_ID,
-            "notary": notary,
-            "operation_domain": hex0x(&keccak256(OPERATION_DOMAIN)),
-            "authorization_nonce": hex0x(&AUTHORIZATION_NONCE),
-            "transaction_data": hex0x(&transaction_data()),
-            "authorization_digest": hex0x(&authorization_digest()),
-            "code_verifier": verifier,
-            "created_at": T0,
-        })
+        let mut file = submission_json(platform, &notary);
+        file["generator"] = serde_json::json!(
+            "libid-rs: cargo run -p libid-tlsn --example ceremony_fixtures -- <dir>"
+        );
+        file["created_at"] = serde_json::json!(T0);
+        file
     };
 
     // ── X: the browser's two sessions ────────────────────────────────
@@ -532,7 +467,7 @@ async fn main() {
                     "Bearer gho_VGhpcyBpcyBub3QgYSByZWFsIGJlYXJlcg".into(),
                 ),
                 ("Accept", "application/vnd.github+json".into()),
-                ("User-Agent", browser_agent.into()),
+                ("User-Agent", BROWSER_AGENT.into()),
                 ("X-GitHub-Api-Version", "2022-11-28".into()),
                 ("Connection", "close".into()),
             ],
