@@ -511,9 +511,14 @@ async fn main() {
         &sign,
     );
 
+    // As GitHub serves `/user` for the media type the profile pins: pretty
+    // printed, a newline and two spaces before every member and a space after
+    // every colon. A compact body here once let this fixture pass a verifier
+    // that refused every real read; the formatting is the platform's, and
+    // the fixture carries it.
     let recv = answer(
         "application/json; charset=utf-8",
-        r#"{"login":"octocat","id":583231,"node_id":"MDQ6VXNlcjU4MzIzMQ==","name":"The Octocat"}"#,
+        "{\n  \"login\": \"octocat\",\n  \"id\": 583231,\n  \"node_id\": \"MDQ6VXNlcjU4MzIzMQ==\",\n  \"avatar_url\": \"https://avatars.githubusercontent.com/u/583231?v=4\",\n  \"type\": \"User\",\n  \"name\": \"The Octocat\"\n}",
     );
     // As `identityRequest` sets them, the browser's own user-agent among them.
     let sent = exchange(
