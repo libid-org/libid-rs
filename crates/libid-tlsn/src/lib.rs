@@ -73,6 +73,7 @@ pub use hyper::{
 };
 pub use session::{
     prover_generic,
+    prover_proxy,
     root_store,
     verifier,
     CommitmentOpening,

@@ -28,10 +28,14 @@ use tlsn::{
         prove::ProveConfig,
         prover::ProverConfig,
         tls::TlsClientConfig,
-        tls_commit::mpc::MpcTlsConfig,
+        tls_commit::{
+            mpc::MpcTlsConfig,
+            proxy::ProxyTlsConfig,
+        },
         verifier::VerifierConfig,
     },
     connection::{
+        DnsName,
         HandshakeData,
         ServerName,
     },
@@ -348,6 +352,42 @@ fn origin_form<B>(request: &mut hyper::Request<B>) -> Result<()> {
     Ok(())
 }
 
+/// Which commitment protocol a session runs.
+///
+/// Not public, and deliberately: a caller picks a transport by calling
+/// [`prover_generic`] or [`prover_proxy`], which is one decision made at one
+/// place rather than a parameter that can be threaded through three layers and
+/// arrive wrong.
+#[derive(Clone, Copy, Debug)]
+enum Transport {
+    /// MPC-TLS. This side opens the connection to the server; the notary takes
+    /// part in encrypting it and never sees the plaintext.
+    Mpc,
+    /// Proxy-TLS. The NOTARY opens the connection to the server and this side
+    /// reaches it through the session mux. The notary still never sees the
+    /// plaintext -- it forwards ciphertext -- but the egress is its.
+    Proxy,
+}
+
+/// What this side authenticates the server against, on either transport.
+///
+/// One function because both transports need the identical value and a second
+/// spelling of it is a second thing that can disagree about which roots a
+/// session trusts.
+fn tls_client_config(api_host: &str) -> Result<TlsClientConfig> {
+    TlsClientConfig::builder()
+        .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
+            Error::MpcTlsFailed {
+                detail: format!("server name: {e}"),
+            }
+        })?))
+        .root_store(root_store())
+        .build()
+        .map_err(|e| Error::MpcTlsFailed {
+            detail: format!("tls client config: {e}"),
+        })
+}
+
 /// Run the MPC-TLS prover with arbitrary API parameters.
 ///
 /// `select_layout` receives both complete transcripts once the HTTP exchange
@@ -386,6 +426,67 @@ fn origin_form<B>(request: &mut hyper::Request<B>) -> Result<()> {
 #[instrument(skip_all)]
 pub async fn prover_generic<T, S, F>(
     socket: T,
+    request: hyper::Request<http_body_util::Full<Bytes>>,
+    select_layout: S,
+    on_progress: F,
+) -> Result<ProverResult<T>>
+where
+    T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+    S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
+    F: Fn(ProverStep),
+{
+    prover_with(Transport::Mpc, socket, request, select_layout, on_progress).await
+}
+
+/// The same session, reached through the notary rather than opened here.
+///
+/// Everything a caller sees is identical to [`prover_generic`] -- the same
+/// arguments, the same layout callback, the same [`ProverResult`], and the
+/// same attested record for the Platform Verifier to read. Only the way the
+/// server is reached differs: the notary opens the connection and forwards
+/// ciphertext, so `socket` carries the platform's traffic as well as the
+/// protocol's, and this process makes no outbound connection of its own.
+///
+/// That is the whole reason to choose it. A prover that cannot reach the
+/// platform directly -- a browser, or a service whose egress is closed -- can
+/// still run the session, and a deployment that would rather not egress to
+/// every platform it supports need not.
+///
+/// It is NOT more or less private. The notary sees the same ciphertext either
+/// way and the plaintext neither way; what moves is which side dials.
+#[instrument(skip_all)]
+pub async fn prover_proxy<T, S, F>(
+    socket: T,
+    request: hyper::Request<http_body_util::Full<Bytes>>,
+    select_layout: S,
+    on_progress: F,
+) -> Result<ProverResult<T>>
+where
+    T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+    S: FnOnce(&[u8], &[u8]) -> Result<(Layout, Layout)>,
+    F: Fn(ProverStep),
+{
+    prover_with(
+        Transport::Proxy,
+        socket,
+        request,
+        select_layout,
+        on_progress,
+    )
+    .await
+}
+
+/// Both provers, which are one prover with one branch.
+///
+/// The two public entry points above exist so a caller states its transport by
+/// choosing a function rather than passing a value; everything they share is
+/// here, once, because the parts that are not the connection -- the HTTP
+/// exchange, the disclosure the prover chooses, the commitments, the attested
+/// record -- are the parts a verifier reads, and two copies of them is two
+/// copies that can disagree about what a session proves.
+async fn prover_with<T, S, F>(
+    transport: Transport,
+    socket: T,
     mut request: hyper::Request<http_body_util::Full<Bytes>>,
     select_layout: S,
     on_progress: F,
@@ -421,56 +522,99 @@ where
     let established = AtomicBool::new(false);
     let established = &established;
     let setup = async {
-        info!("Setting up MPC-TLS");
-        let prover = handle
-            .new_prover(ProverConfig::builder().build().map_err(|e| {
-                Error::MpcTlsFailed {
-                    detail: format!("prover config: {e}"),
-                }
-            })?)
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("new prover: {e}"),
-            })?
-            .commit(
-                MpcTlsConfig::builder()
-                    .max_sent_data(MAX_SENT_DATA)
-                    .max_recv_data(MAX_RECV_DATA)
-                    .build()
-                    .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("mpc tls config: {e}"),
-                    })?,
-            )
-            .await
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("commit: {e}"),
-            })?;
-        info!("MPC-TLS setup complete");
-        on_progress(ProverStep::MpcSetupComplete);
-
-        info!("Connecting to {} API", api_host);
-        let tcp = tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
-        let (tls, prover) = prover
-            .connect(
-                TlsClientConfig::builder()
-                    .server_name(ServerName::Dns(api_host.try_into().map_err(|e| {
+        // The commitment protocol, and the ONLY place the two transports
+        // differ. Everything after it is the same work on the same types: a
+        // connected prover's future resolves to `Prover<state::Committed>`
+        // whichever way the connection was made, so the HTTP exchange, the
+        // layout the prover chooses, the commitments and the attested record
+        // are written once and mean the same thing in both.
+        let (tls, prover_task) = match transport {
+            // The prover opens the connection to the server and the notary
+            // takes part in encrypting it. Egress to the platform is this
+            // side's.
+            Transport::Mpc => {
+                info!("Setting up MPC-TLS");
+                let prover = handle
+                    .new_prover(ProverConfig::builder().build().map_err(|e| {
                         Error::MpcTlsFailed {
-                            detail: format!("server name: {e}"),
+                            detail: format!("prover config: {e}"),
                         }
-                    })?))
-                    .root_store(root_store())
-                    .build()
+                    })?)
                     .map_err(|e| Error::MpcTlsFailed {
-                        detail: format!("tls client config: {e}"),
-                    })?,
-                tcp.compat(),
-            )
-            .map_err(|e| Error::MpcTlsFailed {
-                detail: format!("connect: {e}"),
-            })?;
+                        detail: format!("new prover: {e}"),
+                    })?
+                    .commit(
+                        MpcTlsConfig::builder()
+                            .max_sent_data(MAX_SENT_DATA)
+                            .max_recv_data(MAX_RECV_DATA)
+                            .build()
+                            .map_err(|e| Error::MpcTlsFailed {
+                                detail: format!("mpc tls config: {e}"),
+                            })?,
+                    )
+                    .await
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("commit: {e}"),
+                    })?;
+                info!("MPC-TLS setup complete");
+                on_progress(ProverStep::MpcSetupComplete);
+
+                info!("Connecting to {} API", api_host);
+                let tcp =
+                    tokio::net::TcpStream::connect(format!("{}:443", api_host)).await?;
+                let (tls, prover) = prover
+                    .connect(tls_client_config(api_host)?, tcp.compat())
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("connect: {e}"),
+                    })?;
+                (tls, AbortOnDrop::new(tokio::spawn(prover.into_future())))
+            }
+            // The NOTARY opens the connection to the server, and this side
+            // reaches it through the session mux. There is no socket to pass
+            // and no egress from here -- which is the whole reason a caller
+            // that cannot reach the platform itself, or must not, uses this.
+            Transport::Proxy => {
+                info!("Setting up Proxy-TLS");
+                let prover = handle
+                    .new_prover(ProverConfig::builder().build().map_err(|e| {
+                        Error::MpcTlsFailed {
+                            detail: format!("prover config: {e}"),
+                        }
+                    })?)
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("new prover: {e}"),
+                    })?
+                    .commit(
+                        ProxyTlsConfig::builder()
+                            .server_name(DnsName::try_from(api_host).map_err(|e| {
+                                Error::MpcTlsFailed {
+                                    detail: format!("server name: {e}"),
+                                }
+                            })?)
+                            .build()
+                            .map_err(|e| Error::MpcTlsFailed {
+                                detail: format!("proxy tls config: {e}"),
+                            })?,
+                    )
+                    .await
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("commit: {e}"),
+                    })?;
+                info!("Proxy-TLS setup complete");
+                on_progress(ProverStep::MpcSetupComplete);
+
+                info!("Reaching {} through the notary", api_host);
+                let (tls, prover) = prover
+                    .connect(tls_client_config(api_host)?)
+                    .map_err(|e| Error::MpcTlsFailed {
+                        detail: format!("connect: {e}"),
+                    })?;
+                (tls, AbortOnDrop::new(tokio::spawn(prover.into_future())))
+            }
+        };
         info!("TLS handshake complete");
         on_progress(ProverStep::TlsHandshakeComplete);
 
-        let prover_task = AbortOnDrop::new(tokio::spawn(prover.into_future()));
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(TokioIo::new(tls.compat()))
                 .await
