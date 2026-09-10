@@ -3416,13 +3416,16 @@ dependencies = [
 name = "libid-tlsn"
 version = "0.3.0"
 dependencies = [
+ "hex",
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
  "libid-ceremony",
+ "libid-crypto",
  "libid-transcript",
  "rangeset",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tlsn",
  "tokio",
