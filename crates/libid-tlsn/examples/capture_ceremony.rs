@@ -230,7 +230,7 @@ async fn notarize(
     )
         -> Result<(Layout, Layout), libid_transcript::ceremony::LayoutError>,
     sign: &dyn Fn(&[u8; 32]) -> Vec<u8>,
-) -> Session {
+) -> Result<Session, String> {
     let (to_verifier, from_prover) = tokio::io::duplex(1 << 16);
     let verifier = tokio::spawn(libid_tlsn::verifier(from_prover));
     let prover = libid_tlsn::prover_generic(
@@ -243,12 +243,21 @@ async fn notarize(
         },
         |step| eprintln!("  prover: {step:?}"),
     )
-    .await
-    .expect("the prover's session");
+    .await;
+    let prover = match prover {
+        Ok(prover) => prover,
+        Err(e) => {
+            // Stop the verifier before reporting, so the runtime is not torn
+            // down under a live session.
+            verifier.abort();
+            let _ = verifier.await;
+            return Err(format!("the prover's session: {e}"));
+        }
+    };
     let observed = verifier
         .await
-        .expect("verifier task")
-        .expect("the verifier's session");
+        .map_err(|e| format!("verifier task: {e}"))?
+        .map_err(|e| format!("the verifier's session: {e}"))?;
     let ServerName::Dns(ref name) = observed.server_name;
     let authority = name.as_str().to_owned();
     let created_at = now();
@@ -269,13 +278,18 @@ async fn notarize(
         data.received.revealed.len(),
         data.received.commitments.len()
     );
-    Session {
+    Ok(Session {
         record,
         signature,
         created_at,
         response_body: prover.response_body,
         authority,
-    }
+    })
+}
+
+fn fail(message: String) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(1)
 }
 
 fn session_json(endpoint: &str, session: &Session) -> serde_json::Value {
@@ -365,7 +379,8 @@ async fn main() {
                 },
                 &sign,
             )
-            .await;
+            .await
+            .unwrap_or_else(fail);
             let bearer = bearer_of(&token.response_body);
             eprintln!("token received; running the identity session");
             let identity = notarize(
@@ -388,7 +403,8 @@ async fn main() {
                 },
                 &sign,
             )
-            .await;
+            .await
+            .unwrap_or_else(fail);
             (
                 session_json("https://api.x.com/2/oauth2/token", &token),
                 session_json("https://api.x.com/2/users/me", &identity),
@@ -428,7 +444,8 @@ async fn main() {
                 },
                 &sign,
             )
-            .await;
+            .await
+            .unwrap_or_else(fail);
             let bearer = bearer_of(&token.response_body);
             eprintln!("token received; running the identity session");
             // As the browser's `identityRequest` sets them.
@@ -454,7 +471,8 @@ async fn main() {
                 },
                 &sign,
             )
-            .await;
+            .await
+            .unwrap_or_else(fail);
             (
                 session_json("https://github.com/login/oauth/access_token", &token),
                 session_json("https://api.github.com/user", &identity),
