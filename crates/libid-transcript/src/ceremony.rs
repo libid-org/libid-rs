@@ -633,7 +633,10 @@ mod tests {
 
 #[cfg(test)]
 mod tables {
-    use super::profiles;
+    use super::{
+        profiles,
+        Layout,
+    };
 
     /// The ceremony profiles and the identity system name the same platforms.
     ///
@@ -660,5 +663,33 @@ mod tables {
         assert_eq!(profiles::X.platform, PLATFORM_X_DOMAIN);
         assert_eq!(profiles::GITHUB.platform, PLATFORM_GITHUB_DOMAIN);
         assert_eq!(profiles::GOOGLE.platform, PLATFORM_GOOGLE_DOMAIN);
+    }
+
+    #[test]
+    fn github_pretty_prints_and_the_layout_carries_the_whitespace() {
+        // The response GitHub serves for the profile's media type, and the
+        // two members the profile reads out of it, revealed as the wire
+        // carries them -- whitespace inside, at its offsets.
+        let body =
+            "{\n  \"login\": \"octocat\",\n  \"id\": 583231,\n  \"node_id\": \"x\"\n}";
+        let recv = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let layout = Layout::identity_response(
+            recv.as_bytes(),
+            &profiles::GITHUB.identity.unwrap(),
+        )
+        .unwrap();
+        let revealed: Vec<&[u8]> = layout
+            .reveal
+            .iter()
+            .map(|range| &recv.as_bytes()[range.clone()])
+            .collect();
+        assert!(
+            revealed.contains(&&b"\"login\": \"octocat\""[..]),
+            "{revealed:?}"
+        );
+        assert!(revealed.contains(&&b"\"id\": 583231,"[..]), "{revealed:?}");
     }
 }
