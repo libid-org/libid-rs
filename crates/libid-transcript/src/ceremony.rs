@@ -160,13 +160,8 @@ impl Layout {
     /// committed range is indistinguishable from a `refresh_token` value, or any
     /// other substring the prover chose to commit (REQ-PLAT-57, REQ-PLAT-58).
     pub fn token_response(recv: &[u8]) -> Result<Self, LayoutError> {
-        // Named once, and a constant rather than a parameter. `access_token` is
-        // RFC 6749 section 5.1, not a platform's choice -- which is why the
-        // contract pins `ACCESS_TOKEN_PREFIX` on `TlsNotaryVerifierBase`, shared by
-        // every profile, while the things that ARE platform choices are per-profile
-        // virtuals there and parameters here: the committed body credential of
-        // `Layout::token_request`, the field names of
-        // `Layout::identity_response`.
+        // RFC 6749 names the field for every profile. The shared verifier
+        // matches the same whitespace-aware prefix in requireJsonStringCommitment.
         const FIELD: &str = "access_token";
         let missing = || LayoutError::MissingField(FIELD.into());
 
@@ -333,6 +328,23 @@ mod tests {
 
     const X_TOKEN_REQ: &[u8] =
         b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
+
+    #[test]
+    fn token_whitespace_is_revealed_and_never_committed_with_the_bearer() {
+        for ws in [" ", "\t", "\r", "\n", " \t\r\n"] {
+            let prefix = format!("\"access_token\"{ws}:{ws}\"");
+            let recv = format!("HTTP/1.1 200 OK\r\n\r\n{{{prefix}SECRET\"}}");
+            let recv = recv.as_bytes();
+            let layout = Layout::token_response(recv).unwrap();
+            assert!(tiles(&layout, recv.len()));
+            assert_eq!(&recv[layout.reveal[0].clone()], prefix.as_bytes());
+            assert_eq!(
+                &recv[layout.reveal[0].end..layout.reveal[1].start],
+                b"SECRET"
+            );
+            assert_eq!(&recv[layout.reveal[1].clone()], b"\"");
+        }
+    }
 
     #[test]
     fn a_bearer_split_by_chunk_framing_is_refused() {

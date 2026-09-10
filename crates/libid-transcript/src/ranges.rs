@@ -119,24 +119,8 @@ fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// The `"key":"value"` member, from the key's opening quote through the
-/// value's closing quote.
-///
-/// # The template is the reader's
-///
-/// `CeremonyFields.tryJsonString` matches the literal `"<name>":"`, so this
-/// matches the same bytes. Anything looser picks a range the reader cannot
-/// read: a body written `"login" : "octocat"` would be revealed here and then
-/// met with `FieldNotFound` on chain, which is the same refusal reported where
-/// nobody can see why. Failing here fails it where the reason is visible.
-///
-/// Uniqueness is NOT checked here, and that is deliberate. The reader refuses
-/// a delimiter matching twice in the bytes it was shown (REQ-COMMON-19A), and
-/// which bytes those are is exactly what a layout decides -- so
-/// `identity_response` reveals one member and commits the other, and the
-/// reader sees one. Refusing a second occurrence here would only stop an
-/// honest prover from building that layout; a dishonest one does not run this
-/// code at all.
+/// The string member, including its exact JSON whitespace and quotes.
+/// JSON whitespace is accepted around the colon; offsets refer to raw bytes.
 pub fn find_json_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
     JsonMember::in_body(body, field).map(|member| member.member)
 }
@@ -168,14 +152,9 @@ impl JsonMember {
     /// in the function name, stranded a preposition on the end of it, and left
     /// the coordinate system -- the thing this module gets wrong most
     /// expensively -- unsaid.
-    ///
-    /// The template it matches, and why that template is exactly the reader's,
-    /// is argued on [`find_json_snippet_range`], which is the public face of
-    /// this scan.
     fn in_body(body: &[u8], field: &str) -> Option<Self> {
-        let needle = format!("\"{field}\":\"");
-        let start = find_first(body, needle.as_bytes())?;
-        let value = start.checked_add(needle.len())?;
+        let (start, quote) = json_field_start(body, field, true)?;
+        let value = quote.checked_add(1)?;
         let close = body
             .get(value..)?
             .iter()
@@ -245,6 +224,31 @@ fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
     (raw == decoded).then_some(())
 }
 
+fn skip_json_whitespace(data: &[u8], mut at: usize) -> usize {
+    while matches!(data.get(at), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        at += 1;
+    }
+    at
+}
+
+fn json_field_start(data: &[u8], field: &str, quoted: bool) -> Option<(usize, usize)> {
+    let key = format!("\"{field}\"");
+    for (start, bytes) in data.windows(key.len()).enumerate() {
+        if bytes != key.as_bytes() {
+            continue;
+        }
+        let colon = skip_json_whitespace(data, start + key.len());
+        if data.get(colon) != Some(&b':') {
+            continue;
+        }
+        let value = skip_json_whitespace(data, colon + 1);
+        if !quoted || data.get(value) == Some(&b'"') {
+            return Some((start, value));
+        }
+    }
+    None
+}
+
 /// Find the byte range of a bare (unquoted) JSON number snippet:
 /// `"key":<number>,`. The range runs from the key's opening `"` through the
 /// trailing `,` that follows the number (matching the on-chain `idSuffix=,`).
@@ -253,15 +257,8 @@ fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
 /// number; both terminators are included in the range (on-chain
 /// `tryJsonInteger` scans digits and stops at either).
 pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
-    let needle = format!("\"{field}\":");
-    let start = find_first(body, needle.as_bytes())?;
-    let from = start.checked_add(needle.len())?;
+    let (start, from) = json_field_start(body, field, false)?;
 
-    // Digits, then the byte that closes them -- the order `tryJsonInteger`
-    // reads in. Scanning instead to the first `,` or `}` would accept
-    // `"id":"7",`, a quoted value returned as though it were a number: the
-    // chain then refuses it as noncanonical, which is the same answer given
-    // where nobody can see the reason.
     let rest = body.get(from..)?;
     let width = rest.iter().take_while(|b| b.is_ascii_digit()).count();
     if width == 0 {
@@ -275,7 +272,7 @@ pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<us
     // The terminator is revealed with the digits: it is what proves they are
     // the whole number rather than a prefix of a longer one, and the profile
     // fixes it as `,` or `}` and no other byte (REQ-PLAT-51).
-    let term = from.checked_add(width)?;
+    let term = skip_json_whitespace(body, from.checked_add(width)?);
     match body.get(term) {
         Some(b',') | Some(b'}') => Some(start..term.checked_add(1)?),
         _ => None,
@@ -326,6 +323,36 @@ pub fn compute_id_snippet_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whitespace_split_by_chunk_framing_is_not_a_contiguous_field() {
+        let recv = straddling(r#"{"login" "#, r#": "alice"}"#);
+        assert!(compute_field_snippet_range(&recv, "login").is_none());
+        let recv = straddling(r#"{"id": "#, r#"123}"#);
+        assert!(compute_id_snippet_range(&recv, "id", false).is_none());
+    }
+
+    #[test]
+    fn json_whitespace_preserves_raw_member_ranges() {
+        for ws in [" ", "\t", "\r\n"] {
+            let member = format!("\"login\"{ws}:{ws}\"octocat\"");
+            let id = format!("\"id\"{ws}:{ws}123{ws},");
+            let recv = format!("HTTP/1.1 200 OK\r\n\r\n{{{id}{member}}}");
+            let recv = recv.as_bytes();
+            assert_eq!(
+                &recv[compute_field_snippet_range(recv, "login").unwrap()],
+                member.as_bytes()
+            );
+            assert_eq!(
+                &recv[compute_id_snippet_range(recv, "id", false).unwrap()],
+                id.as_bytes()
+            );
+        }
+        for value in ["123 4", "01", "1e3", "1.5", "\"123\"", "\u{000b}123"] {
+            let body = format!("{{\"id\": {value}}}");
+            assert!(find_json_bare_snippet_range(body.as_bytes(), "id").is_none());
+        }
+    }
+
     /// A chunk header that is not a hex size used to end the body silently:
     /// the size parsed as `unwrap_or(0)`, the loop hit `break`, and the caller
     /// got a short body with no error. The reveal ranges are computed from
@@ -384,15 +411,18 @@ mod tests {
     }
 
     #[test]
-    fn a_spaced_member_is_refused_because_the_reader_refuses_it() {
-        // The on-chain needle is the literal `"login":"`. Selecting a range
-        // here that the reader cannot read only moves the same refusal to
-        // where its reason is invisible.
+    fn a_spaced_member_retains_its_original_bytes() {
         let body = br#"{"login" : "octocat"}"#;
-        assert!(find_json_snippet_range(body, "login").is_none());
+        assert_eq!(
+            &body[find_json_snippet_range(body, "login").unwrap()],
+            br#""login" : "octocat""#
+        );
 
         let bare = br#"{"id" : 123}"#;
-        assert!(find_json_bare_snippet_range(bare, "id").is_none());
+        assert_eq!(
+            &bare[find_json_bare_snippet_range(bare, "id").unwrap()],
+            br#""id" : 123}"#
+        );
     }
 
     #[test]
