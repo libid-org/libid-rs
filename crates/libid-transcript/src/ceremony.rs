@@ -335,6 +335,26 @@ mod tests {
         b"POST /2/oauth2/token HTTP/1.1\r\nhost: api.x.com\r\n\r\ngrant_type=authorization_code&client_id=abc&code_verifier=xyz";
 
     #[test]
+    fn a_spaced_access_token_delimiter_is_revealed_and_the_bearer_alone_committed() {
+        // A token service that pretty-prints puts whitespace inside the
+        // delimiter: the delimiter is revealed as served, and the bearer between
+        // the two reveals is what is committed -- never the whitespace with it.
+        for ws in [" ", "\t", "\r", "\n", " \t\r\n"] {
+            let prefix = format!("\"access_token\"{ws}:{ws}\"");
+            let recv = format!("HTTP/1.1 200 OK\r\n\r\n{{{prefix}SECRET\"}}");
+            let recv = recv.as_bytes();
+            let layout = Layout::token_response(recv).unwrap();
+            assert!(tiles(&layout, recv.len()));
+            assert_eq!(&recv[layout.reveal[0].clone()], prefix.as_bytes());
+            assert_eq!(
+                &recv[layout.reveal[0].end..layout.reveal[1].start],
+                b"SECRET"
+            );
+            assert_eq!(&recv[layout.reveal[1].clone()], b"\"");
+        }
+    }
+
+    #[test]
     fn a_bearer_split_by_chunk_framing_is_refused() {
         // The session Rust actually runs. Framing inside the committed range
         // means the circuit opens bytes the token service never returned, and
@@ -633,7 +653,10 @@ mod tests {
 
 #[cfg(test)]
 mod tables {
-    use super::profiles;
+    use super::{
+        profiles,
+        Layout,
+    };
 
     /// The ceremony profiles and the identity system name the same platforms.
     ///
@@ -660,5 +683,33 @@ mod tables {
         assert_eq!(profiles::X.platform, PLATFORM_X_DOMAIN);
         assert_eq!(profiles::GITHUB.platform, PLATFORM_GITHUB_DOMAIN);
         assert_eq!(profiles::GOOGLE.platform, PLATFORM_GOOGLE_DOMAIN);
+    }
+
+    #[test]
+    fn github_pretty_prints_and_the_layout_carries_the_whitespace() {
+        // The response GitHub serves for the profile's media type, and the
+        // two members the profile reads out of it, revealed as the wire
+        // carries them -- whitespace inside, at its offsets.
+        let body =
+            "{\n  \"login\": \"octocat\",\n  \"id\": 583231,\n  \"node_id\": \"x\"\n}";
+        let recv = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let layout = Layout::identity_response(
+            recv.as_bytes(),
+            &profiles::GITHUB.identity.unwrap(),
+        )
+        .unwrap();
+        let revealed: Vec<&[u8]> = layout
+            .reveal
+            .iter()
+            .map(|range| &recv.as_bytes()[range.clone()])
+            .collect();
+        assert!(
+            revealed.contains(&&b"\"login\": \"octocat\""[..]),
+            "{revealed:?}"
+        );
+        assert!(revealed.contains(&&b"\"id\": 583231,"[..]), "{revealed:?}");
     }
 }
