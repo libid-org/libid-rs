@@ -120,15 +120,19 @@ fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The `"key":"value"` member, from the key's opening quote through the
-/// value's closing quote.
+/// value's closing quote, with whatever JSON whitespace sits between them.
 ///
 /// # The template is the reader's
 ///
-/// `CeremonyFields.tryJsonString` matches the literal `"<name>":"`, so this
-/// matches the same bytes. Anything looser picks a range the reader cannot
-/// read: a body written `"login" : "octocat"` would be revealed here and then
-/// met with `FieldNotFound` on chain, which is the same refusal reported where
-/// nobody can see why. Failing here fails it where the reason is visible.
+/// `CeremonyFields.tryJsonString` removes the JSON whitespace beside a
+/// structural byte from the bytes it is shown and then matches the literal
+/// `"<name>":"`, so this accepts exactly what that removal maps onto the
+/// literal -- whitespace between the key and the colon, and between the colon
+/// and the value -- and nothing else. Anything looser picks a range the reader
+/// cannot read: a body written `"login" "octocat"`, no colon, would be
+/// revealed here and then met with `FieldNotFound` on chain, which is the same
+/// refusal reported where nobody can see why. Failing here fails it where the
+/// reason is visible.
 ///
 /// Uniqueness is NOT checked here, and that is deliberate. The reader refuses
 /// a delimiter matching twice in the bytes it was shown (REQ-COMMON-19A), and
@@ -174,39 +178,20 @@ impl JsonMember {
     /// this scan.
     fn in_body(body: &[u8], field: &str) -> Option<Self> {
         // The key, then `:`, then the value's opening quote, with the
-        // whitespace JSON allows on either side of the colon (RFC 8259
-        // section 2). GitHub pretty-prints its identity response, so a
-        // template without the allowance matches nothing it serves. The
-        // whitespace stays inside the member: the verifier reads the range as
-        // the wire carried it and removes that whitespace itself before it
-        // compares, so the range has to carry it.
-        let key = format!("\"{field}\"");
-        let mut from = 0;
-        loop {
-            let start =
-                find_first(body.get(from..)?, key.as_bytes())?.checked_add(from)?;
-            let colon = skip_json_whitespace(body, start.checked_add(key.len())?);
-            if body.get(colon) == Some(&b':') {
-                let quote = skip_json_whitespace(body, colon.checked_add(1)?);
-                if body.get(quote) == Some(&b'"') {
-                    let value = quote.checked_add(1)?;
-                    let close = body
-                        .get(value..)?
-                        .iter()
-                        .position(|&b| b == b'"')?
-                        .checked_add(value)?;
-                    return Some(Self {
-                        // From the opening `"` of the key through the closing `"`
-                        // of the value.
-                        member: start..close.checked_add(1)?,
-                        value: value..close,
-                    });
-                }
-            }
-            // A `"login"` that is a value, not a key, or a key of another
-            // shape: keep looking past it.
-            from = start.checked_add(1)?;
-        }
+        // whitespace JSON allows on either side of the colon kept inside the
+        // member -- [`key_and_value`] says why.
+        let (start, quote) = key_and_value(body, field, true)?;
+        let value = quote.checked_add(1)?;
+        let close = body
+            .get(value..)?
+            .iter()
+            .position(|&b| b == b'"')?
+            .checked_add(value)?;
+        Some(Self {
+            // From the opening `"` of the key through the closing `"` of the value.
+            member: start..close.checked_add(1)?,
+            value: value..close,
+        })
     }
 
     /// The member named `field_name` in an HTTP response, with offsets into the
@@ -257,6 +242,33 @@ fn skip_json_whitespace(body: &[u8], mut at: usize) -> usize {
     at
 }
 
+/// The first `"field"` in `body` that a colon follows, as the offset of the
+/// key's opening quote and the offset of the value's first byte -- past the
+/// whitespace JSON allows on either side of the colon (RFC 8259 section 2),
+/// and, when `quoted`, only where that byte is the value's opening quote.
+///
+/// A `"login"` that is another member's value, or a key of another shape, is
+/// passed over. GitHub pretty-prints its identity response, so a template
+/// without the whitespace allowance matches nothing it serves. The whitespace
+/// stays inside the member a caller cuts from these offsets: the verifier
+/// reads the range as the wire carried it and removes that whitespace itself
+/// before it compares, so the range has to carry it.
+fn key_and_value(body: &[u8], field: &str, quoted: bool) -> Option<(usize, usize)> {
+    let key = format!("\"{field}\"");
+    let mut from = 0;
+    loop {
+        let start = find_first(body.get(from..)?, key.as_bytes())?.checked_add(from)?;
+        let colon = skip_json_whitespace(body, start.checked_add(key.len())?);
+        if body.get(colon) == Some(&b':') {
+            let value = skip_json_whitespace(body, colon.checked_add(1)?);
+            if !quoted || body.get(value) == Some(&b'"') {
+                return Some((start, value));
+            }
+        }
+        from = start.checked_add(1)?;
+    }
+}
+
 /// The raw bytes are the member, and not the member with framing through it.
 ///
 /// A chunked body carries `\r\n<size>\r\n` between chunks, and that framing
@@ -282,41 +294,31 @@ fn require_contiguous(raw: &[u8], decoded: &[u8]) -> Option<()> {
 /// number; both terminators are included in the range (on-chain
 /// `tryJsonInteger` scans digits and stops at either).
 pub fn find_json_bare_snippet_range(body: &[u8], field: &str) -> Option<Range<usize>> {
-    let key = format!("\"{field}\"");
-    let mut from = 0;
-    loop {
-        let start = find_first(body.get(from..)?, key.as_bytes())?.checked_add(from)?;
-        let colon = skip_json_whitespace(body, start.checked_add(key.len())?);
-        if body.get(colon) != Some(&b':') {
-            from = start.checked_add(1)?;
-            continue;
-        }
-        let digits = skip_json_whitespace(body, colon.checked_add(1)?);
+    let (start, digits) = key_and_value(body, field, false)?;
 
-        // Digits, then the byte that closes them -- the order `tryJsonInteger`
-        // reads in. Scanning instead to the first `,` or `}` would accept
-        // `"id":"7",`, a quoted value returned as though it were a number: the
-        // chain then refuses it as noncanonical, which is the same answer given
-        // where nobody can see the reason.
-        let rest = body.get(digits..)?;
-        let width = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-        if width == 0 {
-            return None;
-        }
-        // A leading zero is noncanonical, and `0` alone is not a leading zero.
-        if width > 1 && rest[0] == b'0' {
-            return None;
-        }
+    // Digits, then the byte that closes them -- the order `tryJsonInteger`
+    // reads in. Scanning instead to the first `,` or `}` would accept
+    // `"id":"7",`, a quoted value returned as though it were a number: the
+    // chain then refuses it as noncanonical, which is the same answer given
+    // where nobody can see the reason.
+    let rest = body.get(digits..)?;
+    let width = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if width == 0 {
+        return None;
+    }
+    // A leading zero is noncanonical, and `0` alone is not a leading zero.
+    if width > 1 && rest[0] == b'0' {
+        return None;
+    }
 
-        // The terminator is revealed with the digits: it is what proves they are
-        // the whole number rather than a prefix of a longer one, and the profile
-        // fixes it as `,` or `}` and no other byte (REQ-PLAT-51). JSON
-        // whitespace may sit before it, and is revealed with it.
-        let term = skip_json_whitespace(body, digits.checked_add(width)?);
-        return match body.get(term) {
-            Some(b',') | Some(b'}') => Some(start..term.checked_add(1)?),
-            _ => None,
-        };
+    // The terminator is revealed with the digits: it is what proves they are
+    // the whole number rather than a prefix of a longer one, and the profile
+    // fixes it as `,` or `}` and no other byte (REQ-PLAT-51). JSON
+    // whitespace may sit before it, and is revealed with it.
+    let term = skip_json_whitespace(body, digits.checked_add(width)?);
+    match body.get(term) {
+        Some(b',') | Some(b'}') => Some(start..term.checked_add(1)?),
+        _ => None,
     }
 }
 
@@ -449,6 +451,59 @@ mod tests {
         // keeps that space and refuses it as the terminator, and so nothing is
         // revealed for it here.
         assert_eq!(find_json_bare_snippet_range(b"{\"id\":123 4}", "id"), None);
+    }
+
+    #[test]
+    fn every_json_whitespace_byte_is_kept_inside_the_member() {
+        // Each byte RFC 8259 section 2 calls whitespace, alone and as a run,
+        // on both sides of the colon and before the integer's terminator: the
+        // ranges are the members as the wire carries them.
+        for ws in [" ", "\t", "\n", "\r", " \t\r\n"] {
+            let member = format!("\"login\"{ws}:{ws}\"octocat\"");
+            let id = format!("\"id\"{ws}:{ws}123{ws},");
+            let recv = format!("HTTP/1.1 200 OK\r\n\r\n{{{id}{member}}}");
+            let recv = recv.as_bytes();
+            assert_eq!(
+                &recv[compute_field_snippet_range(recv, "login").unwrap()],
+                member.as_bytes()
+            );
+            assert_eq!(
+                &recv[compute_id_snippet_range(recv, "id", false).unwrap()],
+                id.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn a_byte_json_does_not_call_whitespace_is_not_skipped() {
+        // Vertical tab and form feed are whitespace to a text editor and not
+        // to RFC 8259; the reader on chain keeps them, so nothing is found
+        // over them here.
+        for ws in ["\u{000b}", "\u{000c}"] {
+            let body = format!("{{\"login\":{ws}\"octocat\",\"id\":{ws}123}}");
+            assert_eq!(find_json_snippet_range(body.as_bytes(), "login"), None);
+            assert_eq!(find_json_bare_snippet_range(body.as_bytes(), "id"), None);
+        }
+    }
+
+    #[test]
+    fn a_number_of_another_shape_is_not_a_number() {
+        // Digits and nothing else: an exponent or a fraction puts a byte where
+        // the terminator must be.
+        for value in ["1e3", "1.5"] {
+            let body = format!("{{\"id\": {value}}}");
+            assert_eq!(find_json_bare_snippet_range(body.as_bytes(), "id"), None);
+        }
+    }
+
+    #[test]
+    fn whitespace_split_by_chunk_framing_is_not_a_contiguous_member() {
+        // The framing lands in the whitespace rather than in the value, and
+        // the member still spans two chunks: refused all the same.
+        let recv = straddling(r#"{"login" "#, r#": "alice"}"#);
+        assert!(compute_field_snippet_range(&recv, "login").is_none());
+        let recv = straddling(r#"{"id": "#, r#"123}"#);
+        assert!(compute_id_snippet_range(&recv, "id", false).is_none());
     }
 
     #[test]
