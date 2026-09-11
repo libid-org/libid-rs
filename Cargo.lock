@@ -3389,15 +3389,15 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe0baf23cfda461fc82227695334e27f45a2feff53870a4612a1d01cafd7aed4"
+checksum = "8e2218d0a04555a2cb962465660dd7981d4a462ac1aac27e347414084c7762fc"
 
 [[package]]
 name = "libid-profiles"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dab7ecd48e0d3c233192f235e4cc6f90dc6b62fe6ffb9903d99120e6f70c895"
+checksum = "b500f5875925c4bce39377730a0ffc8f66dd4d623fc7c1555411b48b2076530e"
 
 [[package]]
 name = "libid-signer"
