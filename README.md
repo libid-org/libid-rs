@@ -13,13 +13,17 @@ record the libID on-chain verifiers check.
 | `libid-transcript` | yes | The tlsn-free half of the MPC-TLS toolkit. HTTP/JSON transcript range math for selective disclosure (header/body/chunked decoding, `"key":"value"` and bare-number member ranges); the per-session ceremony reveal layouts, built from the profile table generated in libid-contracts; the length-prefixed JSON wire protocol notary and prover speak after MPC-TLS closes; the `AttestationWire` type. |
 | `libid-ceremony` | yes | The attested-data record a notary signs: the types a Platform Profile pins, their big-endian fixed-width encoder, and the keccak256 over it that is the only preimage a notary signs. Also the GitHub Token Service request and response records with the bounds a served call must satisfy. |
 | `libid-signer` | yes | `ManagedSigner` — one signing identity over a local hex key or an AWS KMS key: EIP-191 claim signing (byte-compatible with `libid_crypto::sign_eth_claim`), bare prehash signing (the tlsn `Secp256k1Eth` format), alloy transaction wallets, public-key accessors, and `SignerSource::from_spec` shape-classified key-spec parsing (64-hex → local key, anything else → KMS). |
-| `libid-tlsn` | **no — git only** | The MPC-TLS session driver over the upstream `tlsn` crate: `prover_generic` and `verifier` over any async socket, the attested-data record built from what a session was observed to be, WebPKI root store. |
+| `libid-tlsn` | **no — git only** | The MPC-TLS session driver over libID's fork of the `tlsn` crate: `prover_generic` and `verifier` over any async socket, the attested-data record built from what a session was observed to be, WebPKI root store. |
 
 ## The tlsn git-dep caveat
 
-`libid-tlsn` depends on the `tlsn` `v0.1.0-alpha.15` git tag; the TLSNotary
-project publishes no `tlsn` crate to crates.io, and cargo refuses to publish
-crates with git dependencies. Consume it as a git dependency:
+`libid-tlsn` depends on libID's fork of `tlsn` ([libid-org/tlsn](https://github.com/libid-org/tlsn),
+branch `integration/notary-alpha15`, pinned by commit in the workspace
+`Cargo.toml` together with the mpz fork it needs); the TLSNotary project
+publishes no `tlsn` crate to crates.io, and cargo refuses to publish crates
+with git dependencies. The notary and every prover that talks to it must pin
+the same fork commit: the fork changes the prove request on the wire. Consume
+it as a git dependency:
 
 ```toml
 [dependencies]

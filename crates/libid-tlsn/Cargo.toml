@@ -5,8 +5,8 @@
 # TLSNotary project publishes nothing to crates.io as of 2026-08: the sparse
 # index 404s for tlsn, tlsn-core, tlsn-prover and tlsn-verifier). Cargo
 # refuses to publish any crate whose manifest names a git dependency, so this
-# crate stays git-only until upstream cuts a crates.io release matching the
-# pinned rev. Consumers (the notary repo) take it as
+# crate stays git-only until upstream ships what libID's fork carries and cuts
+# a crates.io release. Consumers (the notary repo) take it as
 #   libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v<version>" }
 #
 # Everything tlsn-free was deliberately pushed down into `libid-transcript`
@@ -19,7 +19,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MPC-TLS session driver over the upstream tlsn crate: run a prover or verifier (notary) session over any async socket, with selective disclosure computed by libid-transcript. Git-only until tlsn publishes to crates.io."
+description = "MPC-TLS session driver over libID's fork of the tlsn crate: run a prover or verifier (notary) session over any async socket, with selective disclosure computed by libid-transcript. Git-only until tlsn publishes to crates.io."
 publish = false
 
 [dependencies]
