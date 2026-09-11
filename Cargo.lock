@@ -3368,7 +3368,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-ceremony"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bincode 2.0.1",
  "hex",
@@ -3378,7 +3378,7 @@ dependencies = [
 
 [[package]]
 name = "libid-crypto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "k256",
@@ -3401,7 +3401,7 @@ checksum = "b500f5875925c4bce39377730a0ffc8f66dd4d623fc7c1555411b48b2076530e"
 
 [[package]]
 name = "libid-signer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3414,7 +3414,7 @@ dependencies = [
 
 [[package]]
 name = "libid-tlsn"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "http-body-util",
@@ -3436,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "libid-transcript"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "httparse",
  "libid-identity",
