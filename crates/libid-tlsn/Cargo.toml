@@ -43,3 +43,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 # The attested-data tests build tlsn types directly.
 rangeset = "0.4"
 serde_json.workspace = true
+# The fixture generator (`examples/ceremony_fixtures.rs`) signs as a notary
+# does and derives the verifier the way the contracts do.
+libid-crypto.workspace = true
+hex.workspace = true
+sha2 = "0.10"
